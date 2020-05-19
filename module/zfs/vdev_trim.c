@@ -311,7 +311,8 @@ vdev_trim_change_state(vdev_t *vd, vdev_trim_state_t new_state,
 			vd->vdev_trim_secure = secure;
 	}
 
-	boolean_t resumed = !!(vd->vdev_trim_state == VDEV_TRIM_SUSPENDED);
+	vdev_trim_state_t old_state = vd->vdev_trim_state;
+	boolean_t resumed = (old_state == VDEV_TRIM_SUSPENDED);
 	vd->vdev_trim_state = new_state;
 
 	dmu_tx_t *tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
@@ -332,9 +333,12 @@ vdev_trim_change_state(vdev_t *vd, vdev_trim_state_t new_state,
 		    "vdev=%s suspended", vd->vdev_path);
 		break;
 	case VDEV_TRIM_CANCELED:
-		spa_event_notify(spa, vd, NULL, ESC_ZFS_TRIM_CANCEL);
-		spa_history_log_internal(spa, "trim", tx,
-		    "vdev=%s canceled", vd->vdev_path);
+		if (old_state == VDEV_TRIM_ACTIVE ||
+		    old_state == VDEV_TRIM_SUSPENDED) {
+			spa_event_notify(spa, vd, NULL, ESC_ZFS_TRIM_CANCEL);
+			spa_history_log_internal(spa, "trim", tx,
+			    "vdev=%s canceled", vd->vdev_path);
+		}
 		break;
 	case VDEV_TRIM_COMPLETE:
 		spa_event_notify(spa, vd, NULL, ESC_ZFS_TRIM_FINISH);

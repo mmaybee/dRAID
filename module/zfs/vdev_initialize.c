@@ -121,6 +121,8 @@ vdev_initialize_change_state(vdev_t *vd, vdev_initializing_state_t new_state)
 	if (vd->vdev_initialize_state != VDEV_INITIALIZE_SUSPENDED) {
 		vd->vdev_initialize_action_time = gethrestime_sec();
 	}
+
+	vdev_initializing_state_t old_state = vd->vdev_initialize_state;
 	vd->vdev_initialize_state = new_state;
 
 	dmu_tx_t *tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
@@ -138,8 +140,10 @@ vdev_initialize_change_state(vdev_t *vd, vdev_initializing_state_t new_state)
 		    "vdev=%s suspended", vd->vdev_path);
 		break;
 	case VDEV_INITIALIZE_CANCELED:
-		spa_history_log_internal(spa, "initialize", tx,
-		    "vdev=%s canceled", vd->vdev_path);
+		if (old_state == VDEV_INITIALIZE_ACTIVE ||
+		    old_state == VDEV_INITIALIZE_SUSPENDED)
+			spa_history_log_internal(spa, "initialize", tx,
+			    "vdev=%s canceled", vd->vdev_path);
 		break;
 	case VDEV_INITIALIZE_COMPLETE:
 		spa_history_log_internal(spa, "initialize", tx,

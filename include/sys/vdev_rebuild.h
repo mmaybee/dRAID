@@ -33,6 +33,14 @@ extern "C" {
 #endif
 
 /*
+ * The vr_fault_vdevs array is used by dRAID as an optimization. It allows
+ * the rebuild process to skip fully intact permutation groups.  The vdev
+ * array is sized to handle the worst case of 3 faults in a triple parity
+ * dRAID configration.  These fields are unused for mirrored rebuilds.
+ */
+#define	REBUILD_FAULTS_MAX	3
+
+/*
  * Number of entries in the physical vdev_rebuild_phys structure.  This
  * state is stored per top-level as VDEV_ZAP_TOP_VDEV_REBUILD_PHYS.
  */
@@ -69,7 +77,10 @@ typedef struct vdev_rebuild {
 
 	/* In-core state and progress */
 	uint64_t	vr_scan_offset[TXG_SIZE];
+	uint64_t	vr_faults;		/* total faulted vdevs */
 	uint64_t	vr_prev_scan_time_ms;	/* any previous scan time */
+	vdev_t		*vr_fault_vdevs[REBUILD_FAULTS_MAX]; /* faulted vdevs */
+	boolean_t	vr_rebuild_all;		/* rebuild entire space map */
 
 	/* Per-rebuild pass statistics for calculating bandwidth */
 	uint64_t	vr_pass_start_time;

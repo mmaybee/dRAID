@@ -732,6 +732,7 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_ALLOCATION_BIAS	"alloc_bias"	/* not stored on disk */
 #define	ZPOOL_CONFIG_EXPANSION_TIME	"expansion_time"	/* not stored */
 #define	ZPOOL_CONFIG_REBUILD_STATS	"org.openzfs:rebuild_stats"
+#define	ZPOOL_CONFIG_DRAIDCFG		"org.openzfs:draid_config"
 
 /*
  * The persistent vdev state is stored as separate values rather than a single
@@ -757,10 +758,23 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_LOAD_DATA_ERRORS	"verify_data_errors"
 #define	ZPOOL_CONFIG_REWIND_TIME	"seconds_of_rewind"
 
+/* dRAID configuration stored in ZPOOL_CONFIG_DRAIDCFG nvlist */
+#define	ZPOOL_CONFIG_DRAIDCFG_GUID	"draid_guid"
+#define	ZPOOL_CONFIG_DRAIDCFG_SEED	"draid_seed"
+#define	ZPOOL_CONFIG_DRAIDCFG_DATA	"draid_data"
+#define	ZPOOL_CONFIG_DRAIDCFG_PARITY	"draid_parity"
+#define	ZPOOL_CONFIG_DRAIDCFG_SPARES	"draid_spares"
+#define	ZPOOL_CONFIG_DRAIDCFG_BASE	"draid_base"
+#define	ZPOOL_CONFIG_DRAIDCFG_CHILDREN	"draid_children"
+#define	ZPOOL_CONFIG_DRAIDCFG_PERM	"draid_perm"
+#define	ZPOOL_CONFIG_DRAIDCFG_GROUPS	"draid_groups"
+
 #define	VDEV_TYPE_ROOT			"root"
 #define	VDEV_TYPE_MIRROR		"mirror"
 #define	VDEV_TYPE_REPLACING		"replacing"
 #define	VDEV_TYPE_RAIDZ			"raidz"
+#define	VDEV_TYPE_DRAID			"draid"
+#define	VDEV_TYPE_DRAID_SPARE		"dspare"
 #define	VDEV_TYPE_DISK			"disk"
 #define	VDEV_TYPE_FILE			"file"
 #define	VDEV_TYPE_MISSING		"missing"

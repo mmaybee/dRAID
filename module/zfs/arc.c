@@ -3636,7 +3636,7 @@ arc_hdr_l2hdr_destroy(arc_buf_hdr_t *hdr)
 	l2arc_buf_hdr_t *l2hdr = &hdr->b_l2hdr;
 	l2arc_dev_t *dev = l2hdr->b_dev;
 	uint64_t psize = HDR_GET_PSIZE(hdr);
-	uint64_t asize = vdev_psize_to_asize(dev->l2ad_vdev, psize);
+	uint64_t asize = vdev_psize_to_asize(dev->l2ad_vdev, -1, psize);
 
 	ASSERT(MUTEX_HELD(&dev->l2ad_mtx));
 	ASSERT(HDR_HAS_L2HDR(hdr));
@@ -6135,7 +6135,7 @@ top:
 				cb->l2rcb_zb = *zb;
 				cb->l2rcb_flags = zio_flags;
 
-				asize = vdev_psize_to_asize(vd, size);
+				asize = vdev_psize_to_asize(vd, -1, size);
 				if (asize != size) {
 					abd = abd_alloc_for_io(asize,
 					    HDR_ISTYPE_METADATA(hdr));
@@ -8036,7 +8036,7 @@ top:
 			ARCSTAT_INCR(arcstat_l2_lsize, -HDR_GET_LSIZE(hdr));
 
 			bytes_dropped +=
-			    vdev_psize_to_asize(dev->l2ad_vdev, psize);
+			    vdev_psize_to_asize(dev->l2ad_vdev, -1, psize);
 			(void) zfs_refcount_remove_many(&dev->l2ad_alloc,
 			    arc_hdr_size(hdr), hdr);
 		}
@@ -8418,7 +8418,7 @@ l2arc_log_blk_overhead(uint64_t write_sz, l2arc_dev_t *dev)
 		    dev->l2ad_log_entries - 1) /
 		    dev->l2ad_log_entries;
 
-		return (vdev_psize_to_asize(dev->l2ad_vdev,
+		return (vdev_psize_to_asize(dev->l2ad_vdev, -1,
 		    sizeof (l2arc_log_blk_phys_t)) * log_blocks);
 	}
 }
@@ -8875,7 +8875,7 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz)
 			    HDR_HAS_RABD(hdr));
 			uint64_t psize = HDR_GET_PSIZE(hdr);
 			uint64_t asize = vdev_psize_to_asize(dev->l2ad_vdev,
-			    psize);
+			    -1, psize);
 
 			if ((write_asize + asize) > target_sz) {
 				full = B_TRUE;
@@ -9929,7 +9929,7 @@ l2arc_log_blk_restore(l2arc_dev_t *dev, const l2arc_log_blk_phys_t *lb,
 		 * l2arc_feed_thread() as dev->l2ad_rebuild is set to true.
 		 */
 		size += L2BLK_GET_LSIZE((&lb->lb_entries[i])->le_prop);
-		asize += vdev_psize_to_asize(dev->l2ad_vdev,
+		asize += vdev_psize_to_asize(dev->l2ad_vdev, -1,
 		    L2BLK_GET_PSIZE((&lb->lb_entries[i])->le_prop));
 		l2arc_hdr_restore(&lb->lb_entries[i], dev);
 	}
@@ -9970,7 +9970,7 @@ l2arc_hdr_restore(const l2arc_log_ent_phys_t *le, l2arc_dev_t *dev)
 	    L2BLK_GET_COMPRESS((le)->le_prop),
 	    L2BLK_GET_PROTECTED((le)->le_prop),
 	    L2BLK_GET_PREFETCH((le)->le_prop));
-	asize = vdev_psize_to_asize(dev->l2ad_vdev,
+	asize = vdev_psize_to_asize(dev->l2ad_vdev, -1,
 	    L2BLK_GET_PSIZE((le)->le_prop));
 
 	/*
@@ -10147,7 +10147,7 @@ l2arc_log_blk_commit(l2arc_dev_t *dev, zio_t *pio, l2arc_write_callback_t *cb)
 
 	/* a log block is never entirely zero */
 	ASSERT(psize != 0);
-	asize = vdev_psize_to_asize(dev->l2ad_vdev, psize);
+	asize = vdev_psize_to_asize(dev->l2ad_vdev, -1, psize);
 	ASSERT(asize <= sizeof (*lb));
 
 	/*
@@ -10305,7 +10305,7 @@ l2arc_log_blk_insert(l2arc_dev_t *dev, const arc_buf_hdr_t *hdr)
 	L2BLK_SET_PREFETCH((le)->le_prop, !!(HDR_PREFETCH(hdr)));
 
 	dev->l2ad_log_blk_payload_asize += vdev_psize_to_asize(dev->l2ad_vdev,
-	    HDR_GET_PSIZE(hdr));
+	    -1, HDR_GET_PSIZE(hdr));
 
 	return (dev->l2ad_log_ent_idx == dev->l2ad_log_entries);
 }
