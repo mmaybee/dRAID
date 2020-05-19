@@ -5,6 +5,7 @@ COMMON_H = \
 	zfeature_common.h \
 	zfs_comutil.h \
 	zfs_deleg.h \
+	zfs_draid.h \
 	zfs_fletcher.h \
 	zfs_namecheck.h \
 	zfs_prop.h

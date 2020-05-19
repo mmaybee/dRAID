@@ -25,6 +25,7 @@
  */
 
 #include <sys/vdev_impl.h>
+#include <sys/vdev_draid_impl.h>
 #include <sys/dsl_scan.h>
 #include <sys/spa_impl.h>
 #include <sys/metaslab_impl.h>
@@ -63,8 +64,10 @@
  *
  * Limitations:
  *
- *   - Only supported for mirror vdev types.  Due to the variable stripe
- *     width used by raidz sequential reconstruction is not possible.
+ *   - Only supported for mirror and dRAID vdev types.  Due to the variable
+ *     stripe width used by raidz sequential reconstruction is not possible.
+ *     Note dRAID uses a fixed stripe width which avoids this issue, but
+ *     comes at the expense of some usable capacity.
  *
  *   - Block checksums are not verified during sequential reconstuction.
  *     Similar to traditional RAID the parity/mirror data is reconstructed
@@ -86,9 +89,9 @@
  *     allowing all of these logical blocks to be repaired with a single IO.
  *
  *   - Unlike a healing resilver or scrub which are pool wide operations,
- *     sequential reconstruction is handled by the top-level mirror vdevs.
- *     This allows for it to be started or canceled on a top-level vdev
- *     without impacting any other top-level vdevs in the pool.
+ *     sequential reconstruction is handled by the top-level vdevs.  This
+ *     allows for it to be started or canceled on a top-level vdev without
+ *     impacting any other top-level vdevs in the pool.
  *
  *   - Data only referenced by a pool checkpoint will be repaired because
  *     that space is reflected in the space maps.  This differs for a
@@ -113,6 +116,99 @@ unsigned long zfs_rebuild_max_segment = 1024 * 1024;
  * For vdev_rebuild_initiate_sync() and vdev_rebuild_reset_sync().
  */
 static void vdev_rebuild_thread(void *arg);
+
+/*
+ * Determine if the range is degraded and needs to be rebuilt given the list
+ * of faulted child vdevs.  When vr_rebuild_all is set then all dRAID groups
+ * must be rebuilt, it will always be set for mirror vdevs.
+ */
+static boolean_t
+draid_group_degraded(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
+{
+	uint64_t faults = vr->vr_faults;
+
+	ASSERT(vr->vr_top_vdev->vdev_ops == &vdev_draid_ops);
+	ASSERT3U(faults, <=, REBUILD_FAULTS_MAX);
+
+	if (vr->vr_rebuild_all == B_TRUE)
+		return (B_TRUE);
+
+	for (int i = 0; i < faults; i++) {
+		if (vdev_draid_group_degraded(vr->vr_top_vdev,
+		    vr->vr_fault_vdevs[i], start, size)) {
+			return (B_TRUE);
+		}
+	}
+
+	return (B_FALSE);
+}
+
+/*
+ * For dRAID add up to REBUILD_FAULTS_MAX (3) vdev's to the faulted list.
+ * If we encounter more faulted devices than this it means the replacing /
+ * sparing vdevs likely have more than two children.  In this uncommon
+ * case disable this dRAID optimization and rebuild the entire space map.
+ */
+static int
+add_faulted_guids(vdev_rebuild_t *vr, vdev_t *vd)
+{
+	int error = 0;
+
+	for (uint64_t i = 0; i < vd->vdev_children; i++) {
+		error = add_faulted_guids(vr, vd->vdev_child[i]);
+		if (error)
+			return (error);
+	}
+
+	/* dRAID spares are excluded from the faulted list */
+	if ((vd->vdev_parent->vdev_ops == &vdev_replacing_ops ||
+	    vd->vdev_parent->vdev_ops == &vdev_spare_ops) &&
+	    (vd->vdev_ops != &vdev_draid_spare_ops)) {
+
+		if (vr->vr_faults >= REBUILD_FAULTS_MAX)
+			return (SET_ERROR(EOVERFLOW));
+
+		vr->vr_fault_vdevs[vr->vr_faults] = vd;
+		vr->vr_faults++;
+	}
+
+	return (0);
+}
+
+/*
+ * For a dRAID rebuild determine the guids of any faulted vdevs.  For
+ * a mirror this is not needed and vr_rebuild_all can be set to B_TRUE.
+ */
+static void
+setup_faulted_guids(vdev_rebuild_t *vr)
+{
+	vdev_t *tvd = vr->vr_top_vdev;
+
+	ASSERT(MUTEX_HELD(&tvd->vdev_rebuild_lock));
+
+	vr->vr_faults = 0;
+	bzero(vr->vr_fault_vdevs, sizeof (vdev_t *) * REBUILD_FAULTS_MAX);
+
+	if (tvd->vdev_ops == &vdev_draid_ops) {
+		/*
+		 * Determine the faulted vdevs based on the pool configuration.
+		 * For the purposes of the dRAID rebuild a vdev is considered
+		 * to be faulted if it is a child of either a replacing or
+		 * sparing vdev type.  Tracking these vdevs allows the dRAID
+		 * rebuild to skip regions of the space map where are not
+		 * degraded due to the fault and do not need to be rebuilt.
+		 */
+		if (add_faulted_guids(vr, tvd) != 0)
+			vr->vr_rebuild_all = B_TRUE;
+
+	} else {
+		/*
+		 * For mirrors the entire space map must also always be
+		 * rebuilt.  Indicate this by setting vr->vr_rebuild_all.
+		 */
+		vr->vr_rebuild_all = B_TRUE;
+	}
+}
 
 /*
  * Clear the per-vdev rebuild bytes value for a vdev tree.
@@ -467,8 +563,8 @@ vdev_rebuild_cb(zio_t *zio)
  * Rebuild the data in this range by constructing a special dummy block
  * pointer for the given range.  It has no relation to any existing blocks
  * in the pool.  But by disabling checksum verification and issuing a scrub
- * I/O mirrored vdevs will replicate the block using any available mirror
- * leaf vdevs.
+ * I/O, parity can be rebuilt for fixed-width dRAID vdevs.  Mirrored vdevs
+ * will replicate the block using any available mirror leaf vdevs.
  */
 static void
 vdev_rebuild_rebuild_block(vdev_rebuild_t *vr, uint64_t start, uint64_t asize,
@@ -478,9 +574,13 @@ vdev_rebuild_rebuild_block(vdev_rebuild_t *vr, uint64_t start, uint64_t asize,
 	spa_t *spa = vd->vdev_spa;
 	uint64_t psize = asize;
 
-	ASSERT(vd->vdev_ops == &vdev_mirror_ops ||
+	ASSERT(vd->vdev_ops == &vdev_draid_ops ||
+	    vd->vdev_ops == &vdev_mirror_ops ||
 	    vd->vdev_ops == &vdev_replacing_ops ||
 	    vd->vdev_ops == &vdev_spare_ops);
+
+	if (vd->vdev_ops == &vdev_draid_ops)
+		psize = vdev_draid_asize_to_psize(vd, asize, start);
 
 	blkptr_t blk, *bp = &blk;
 	BP_ZERO(bp);
@@ -532,6 +632,15 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	vr->vr_pass_bytes_scanned += size;
 	vr->vr_rebuild_phys.vrp_bytes_scanned += size;
 
+	/*
+	 * There's no need to issue a rebuild I/O for this range because
+	 * it does not overlap with a degraded dRAID group.
+	 */
+	if (vd->vdev_ops == &vdev_draid_ops &&
+	    !draid_group_degraded(vr, start, size)) {
+		return (0);
+	}
+
 	mutex_enter(&vd->vdev_rebuild_io_lock);
 
 	/* Limit in flight rebuild I/Os */
@@ -579,21 +688,40 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 
 /*
  * Split range into legally-sized logical chunks given the constraints of the
- * top-level mirror vdev type.
+ * top-level dRAID or mirror vdev type.  Chunks may not:
+ *
+ *   - Exceed the pools maximum allowed block size, or
+ *   - Span metaslabs, or
+ *   - Span dRAID redundancy groups.
  */
 static uint64_t
 vdev_rebuild_chunk_size(vdev_t *vd, uint64_t start, uint64_t size)
 {
 	uint64_t chunk_size, max_asize, max_segment;
 
-	ASSERT(vd->vdev_ops == &vdev_mirror_ops ||
-	    vd->vdev_ops == &vdev_replacing_ops ||
-	    vd->vdev_ops == &vdev_spare_ops);
-
 	max_segment = MIN(P2ROUNDUP(zfs_rebuild_max_segment,
 	    1 << vd->vdev_ashift), SPA_MAXBLOCKSIZE);
-	max_asize = vdev_psize_to_asize(vd, max_segment);
-	chunk_size = MIN(size, max_asize);
+
+	if (vd->vdev_ops == &vdev_draid_ops) {
+		uint64_t group, left;
+
+		max_asize = vdev_draid_max_rebuildable_asize(vd, start,
+		    max_segment);
+		chunk_size = MIN(size, max_asize);
+
+		group = vdev_draid_offset_to_group(vd, start);
+		left = vdev_draid_group_to_offset(vd, group + 1) - start;
+		chunk_size = MIN(chunk_size, left);
+		ASSERT3U(vdev_draid_offset_to_group(vd, start), ==,
+		    vdev_draid_offset_to_group(vd, start + chunk_size - 1));
+	} else {
+		ASSERT(vd->vdev_ops == &vdev_mirror_ops ||
+		    vd->vdev_ops == &vdev_replacing_ops ||
+		    vd->vdev_ops == &vdev_spare_ops);
+
+		max_asize = vdev_psize_to_asize(vd, start, max_segment);
+		chunk_size = MIN(size, max_asize);
+	}
 
 	return (chunk_size);
 }
@@ -755,6 +883,7 @@ vdev_rebuild_thread(void *arg)
 	uint64_t update_est_time = gethrtime();
 	vdev_rebuild_update_bytes_est(vd, 0);
 
+	setup_faulted_guids(vr);
 	clear_rebuild_bytes(vr->vr_top_vdev);
 
 	mutex_exit(&vd->vdev_rebuild_lock);

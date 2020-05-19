@@ -93,6 +93,56 @@ compromised.
 The minimum number of devices in a raidz group is one more than the number of
 parity disks.
 The recommended number is between 3 and 9 to help increase performance.
+.It Sy draid , draid1 , draid2 , draid3
+A distributed version of raidz with integrated hot spares that allows faster
+rebuilds while retaining the benefits of raidz.
+Data and parity are organized in redundancy groups and distributed evenly over
+all of the devices.
+.Pp
+Like raidz a draid can have single-, double-, or triple-parity.  The
+.Sy draid1 ,
+.Sy draid2 ,
+and
+.Sy draid3
+types can be used to specified the required parity level.
+The
+.Sy draid
+vdev type is an alias for
+.Sy draid1 .
+Based on the number of devices in the draid reasonable values will be used
+for the number of redundancy groups and distributed hot spares.
+.Pp
+A draid with N disks of size X, G groups, P parity level, and H distributed
+hot spares can hold approximately (N-(G*P)-H)*X bytes and can withstand P
+device(s) failing before data integrity is compromised.
+The minimum number of devices in a draid is (G*(P+1))+1.
+As a general rule, the more devices included in the draid the faster it will
+be to rebuild to a distributed hot spare.
+.It Sy draid[<parity>][:<groups><g|G>][:<spares><s|S>][:<data><d|D>]
+When a non-default draid configuration is required it can be specified by
+appending one or more of the following arguments to the
+.Sy draid
+keyword.
+.Pp
+.Em parity
+- The parity level as described above (1-3).
+.Pp
+.Em groups
+- The number of redundancy groups.
+Increasing the number of groups improves performance at the expense of usable
+capacity, and vise versa.
+.Pp
+.Em spares
+- The number of distributed hot spares.
+Every pool must contain at least one but may contain more.
+.Pp
+.Em data
+The number of data devices per group.
+When specified the expression (N-H)=(G*(D+P)) must be satified for it to be
+a valid configuration.
+When this option is not specified the groups may differ slightly in size in
+order to generate a valid configuration.
+.Pp
 .It Sy spare
 A pseudo-vdev which keeps track of available hot spares for a pool.
 For more information, see the
@@ -272,6 +322,12 @@ An in-progress spare replacement can be cancelled by detaching the hot spare.
 If the original faulted device is detached, then the hot spare assumes its
 place in the configuration, and is removed from the spare list of all active
 pools.
+.Pp
+The draid vdev type provides distributed hot spares.
+These hot spares are named after the draid vdev they're a part of (
+.Qq s0-draid1:1g:1s-0
+) and may only be used by that draid vdev.
+Otherwise, they behave the same as normal hot spares.
 .Pp
 Spares cannot replace log devices.
 .Ss Intent Log

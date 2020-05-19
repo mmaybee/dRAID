@@ -1940,7 +1940,7 @@ zfs_ioc_vdev_attach(zfs_cmd_t *zc)
 	spa_t *spa;
 	nvlist_t *config;
 	int replacing = zc->zc_cookie;
-	int rebuild = zc->zc_simple;
+	int linear = zc->zc_simple;
 	int error;
 
 	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
@@ -1949,7 +1949,7 @@ zfs_ioc_vdev_attach(zfs_cmd_t *zc)
 	if ((error = get_nvlist(zc->zc_nvlist_conf, zc->zc_nvlist_conf_size,
 	    zc->zc_iflags, &config)) == 0) {
 		error = spa_vdev_attach(spa, zc->zc_guid, config, replacing,
-		    rebuild);
+		    linear);
 		nvlist_free(config);
 	}
 

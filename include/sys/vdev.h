@@ -115,7 +115,8 @@ extern void vdev_space_update(vdev_t *vd,
 
 extern int64_t vdev_deflated_space(vdev_t *vd, int64_t space);
 
-extern uint64_t vdev_psize_to_asize(vdev_t *vd, uint64_t psize);
+extern uint64_t vdev_psize_to_asize(vdev_t *vd,
+    uint64_t offset, uint64_t psize);
 
 extern int vdev_fault(spa_t *spa, uint64_t guid, vdev_aux_t aux);
 extern int vdev_degrade(spa_t *spa, uint64_t guid, vdev_aux_t aux);

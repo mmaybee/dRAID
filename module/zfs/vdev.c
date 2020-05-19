@@ -40,6 +40,7 @@
 #include <sys/dsl_dir.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_rebuild.h>
+#include <sys/vdev_draid_impl.h>
 #include <sys/uberblock_impl.h>
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
@@ -190,6 +191,8 @@ vdev_dbgmsg_print_tree(vdev_t *vd, int indent)
 static vdev_ops_t *vdev_ops_table[] = {
 	&vdev_root_ops,
 	&vdev_raidz_ops,
+	&vdev_draid_ops,
+	&vdev_draid_spare_ops,
 	&vdev_mirror_ops,
 	&vdev_replacing_ops,
 	&vdev_spare_ops,
@@ -248,13 +251,13 @@ vdev_derive_alloc_bias(const char *bias)
  * all children.  This is what's used by anything other than RAID-Z.
  */
 uint64_t
-vdev_default_asize(vdev_t *vd, uint64_t psize)
+vdev_default_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
 {
 	uint64_t asize = P2ROUNDUP(psize, 1ULL << vd->vdev_top->vdev_ashift);
 	uint64_t csize;
 
 	for (int c = 0; c < vd->vdev_children; c++) {
-		csize = vdev_psize_to_asize(vd->vdev_child[c], psize);
+		csize = vdev_psize_to_asize(vd->vdev_child[c], offset, psize);
 		asize = MAX(asize, csize);
 	}
 
@@ -293,6 +296,11 @@ vdev_get_min_asize(vdev_t *vd)
 	if (pvd->vdev_ops == &vdev_raidz_ops)
 		return ((pvd->vdev_min_asize + pvd->vdev_children - 1) /
 		    pvd->vdev_children);
+
+	if (pvd->vdev_ops == &vdev_draid_ops) {
+		return (pvd->vdev_min_asize /
+		    (pvd->vdev_children - pvd->vdev_spares));
+	}
 
 	return (pvd->vdev_min_asize);
 }
@@ -526,6 +534,7 @@ vdev_alloc_common(spa_t *spa, uint_t id, uint64_t guid, vdev_ops_t *ops)
 	vd->vdev_ops = ops;
 	vd->vdev_state = VDEV_STATE_CLOSED;
 	vd->vdev_ishole = (ops == &vdev_hole_ops);
+	vd->vdev_cfg = NULL;
 	vic->vic_prev_indirect_vdev = UINT64_MAX;
 
 	rw_init(&vd->vdev_indirect_rwlock, NULL, RW_DEFAULT, NULL);
@@ -548,6 +557,7 @@ vdev_alloc_common(spa_t *spa, uint_t id, uint64_t guid, vdev_ops_t *ops)
 	list_link_init(&vd->vdev_initialize_node);
 	list_link_init(&vd->vdev_leaf_node);
 	list_link_init(&vd->vdev_trim_node);
+
 	mutex_init(&vd->vdev_dtl_lock, NULL, MUTEX_NOLOCKDEP, NULL);
 	mutex_init(&vd->vdev_stat_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&vd->vdev_probe_lock, NULL, MUTEX_DEFAULT, NULL);
@@ -602,6 +612,7 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	vdev_indirect_config_t *vic;
 	char *tmp = NULL;
 	int rc;
+	nvlist_t *draidcfg = NULL;
 	vdev_alloc_bias_t alloc_bias = VDEV_BIAS_NONE;
 	boolean_t top_level = (parent && !parent->vdev_parent);
 
@@ -658,7 +669,7 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	 * Set the nparity property for RAID-Z vdevs.
 	 */
 	nparity = -1ULL;
-	if (ops == &vdev_raidz_ops) {
+	if (ops == &vdev_raidz_ops || ops == &vdev_draid_ops) {
 		if (nvlist_lookup_uint64(nv, ZPOOL_CONFIG_NPARITY,
 		    &nparity) == 0) {
 			if (nparity == 0 || nparity > VDEV_RAIDZ_MAXPARITY)
@@ -709,6 +720,28 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 		}
 	}
 
+	/*
+	 * Verify dRAID is supported and the configuration is valid.
+	 */
+	if (ops == &vdev_draid_ops) {
+		if (nvlist_lookup_nvlist(nv, ZPOOL_CONFIG_DRAIDCFG,
+		    &draidcfg) != 0) {
+			return (SET_ERROR(EINVAL));
+		}
+
+		if (vdev_draid_config_validate(draidcfg, 0, nparity, 0, 0) !=
+		    DRAIDCFG_OK) {
+			return (SET_ERROR(EINVAL));
+		}
+
+		/* spa_vdev_add() expects feature to be enabled */
+		if (alloctype == VDEV_ALLOC_ADD &&
+		    spa->spa_load_state != SPA_LOAD_CREATE &&
+		    !spa_feature_is_enabled(spa, SPA_FEATURE_DRAID)) {
+			return (SET_ERROR(ENOTSUP));
+		}
+	}
+
 	vd = vdev_alloc_common(spa, id, guid, ops);
 	vic = &vd->vdev_indirect_config;
 
@@ -716,6 +749,8 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	vd->vdev_nparity = nparity;
 	if (top_level && alloc_bias != VDEV_BIAS_NONE)
 		vd->vdev_alloc_bias = alloc_bias;
+	if (ops == &vdev_draid_ops)
+		vd->vdev_cfg = fnvlist_dup(draidcfg);
 
 	if (nvlist_lookup_string(nv, ZPOOL_CONFIG_PATH, &vd->vdev_path) == 0)
 		vd->vdev_path = spa_strdup(vd->vdev_path);
@@ -979,6 +1014,9 @@ vdev_free(vdev_t *vd)
 	if (vd->vdev_isl2cache)
 		spa_l2cache_remove(vd);
 
+	if (vd->vdev_cfg)
+		fnvlist_free(vd->vdev_cfg);
+
 	txg_list_destroy(&vd->vdev_ms_list);
 	txg_list_destroy(&vd->vdev_dtl_list);
 
@@ -1050,6 +1088,7 @@ vdev_top_transfer(vdev_t *svd, vdev_t *tvd)
 	int t;
 
 	ASSERT(tvd == tvd->vdev_top);
+	ASSERT(svd->vdev_ops != &vdev_draid_ops);
 
 	tvd->vdev_pending_fastwrite = svd->vdev_pending_fastwrite;
 	tvd->vdev_ms_array = svd->vdev_ms_array;
@@ -1509,6 +1548,9 @@ vdev_probe(vdev_t *vd, zio_t *zio)
 
 	ASSERT(vd->vdev_ops->vdev_op_leaf);
 
+	if (vd->vdev_ops == &vdev_draid_spare_ops)
+		return (NULL);
+
 	/*
 	 * Don't probe the probe.
 	 */
@@ -1662,7 +1704,7 @@ vdev_set_deflate_ratio(vdev_t *vd)
 {
 	if (vd == vd->vdev_top && !vd->vdev_ishole && vd->vdev_ashift != 0) {
 		vd->vdev_deflate_ratio = (1 << 17) /
-		    (vdev_psize_to_asize(vd, 1 << 17) >> SPA_MINBLOCKSHIFT);
+		    (vdev_psize_to_asize(vd, -1, 1 << 17) >> SPA_MINBLOCKSHIFT);
 	}
 }
 
@@ -1879,6 +1921,7 @@ vdev_open(vdev_t *vd)
 	 * vdev open for business.
 	 */
 	if (vd->vdev_ops->vdev_op_leaf &&
+	    vd->vdev_ops != &vdev_draid_spare_ops &&
 	    (error = zio_wait(vdev_probe(vd, NULL))) != 0) {
 		vdev_set_state(vd, B_TRUE, VDEV_STATE_FAULTED,
 		    VDEV_AUX_ERR_EXCEEDED);
@@ -3433,9 +3476,9 @@ vdev_sync(vdev_t *vd, uint64_t txg)
 }
 
 uint64_t
-vdev_psize_to_asize(vdev_t *vd, uint64_t psize)
+vdev_psize_to_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
 {
-	return (vd->vdev_ops->vdev_op_asize(vd, psize));
+	return (vd->vdev_ops->vdev_op_asize(vd, offset, psize));
 }
 
 /*
@@ -3663,6 +3706,9 @@ top:
 
 	if (!vd->vdev_ops->vdev_op_leaf)
 		return (spa_vdev_state_exit(spa, NULL, SET_ERROR(ENOTSUP)));
+
+	if (vd->vdev_ops == &vdev_draid_spare_ops)
+		return (spa_vdev_state_exit(spa, NULL, ENOTSUP));
 
 	tvd = vd->vdev_top;
 	mg = tvd->vdev_mg;
@@ -3908,6 +3954,13 @@ vdev_accessible(vdev_t *vd, zio_t *zio)
 static void
 vdev_get_child_stat(vdev_t *cvd, vdev_stat_t *vs, vdev_stat_t *cvs)
 {
+	/*
+	 * Exclude the dRAID spare when aggregating to avoid double counting
+	 * the ops and bytes.  These IOs are counted by the physical leaves.
+	 */
+	if (cvd->vdev_ops == &vdev_draid_spare_ops)
+		return;
+
 	for (int t = 0; t < VS_ZIO_TYPES; t++) {
 		vs->vs_ops[t] += cvs->vs_ops[t];
 		vs->vs_bytes[t] += cvs->vs_bytes[t];
@@ -4000,7 +4053,6 @@ vdev_get_stats_ex_impl(vdev_t *vd, vdev_stat_t *vs, vdev_stat_ex_t *vsx)
 				vdev_get_child_stat(cvd, vs, cvs);
 			if (vsx)
 				vdev_get_child_stat_ex(cvd, vsx, cvsx);
-
 		}
 	} else {
 		/*
@@ -4180,7 +4232,9 @@ vdev_stat_update(zio_t *zio, uint64_t psize)
 
 			/*
 			 * Repair is the result of a rebuild issued by the
-			 * rebuild thread (vdev_rebuild_thread).
+			 * rebuild thread (vdev_rebuild_thread).  To avoid
+			 * double counting repaired bytes the virtual dRAID
+			 * spare vdev is excluded from the processed bytes.
 			 */
 			if (zio->io_priority == ZIO_PRIORITY_REBUILD) {
 				vdev_t *tvd = vd->vdev_top;
@@ -4188,8 +4242,10 @@ vdev_stat_update(zio_t *zio, uint64_t psize)
 				vdev_rebuild_phys_t *vrp = &vr->vr_rebuild_phys;
 				uint64_t *rebuilt = &vrp->vrp_bytes_rebuilt;
 
-				if (vd->vdev_ops->vdev_op_leaf)
+				if (vd->vdev_ops->vdev_op_leaf &&
+				    vd->vdev_ops != &vdev_draid_spare_ops) {
 					atomic_add_64(rebuilt, psize);
+				}
 				vs->vs_rebuild_processed += psize;
 			}
 
@@ -4287,6 +4343,7 @@ vdev_stat_update(zio_t *zio, uint64_t psize)
 
 	if (spa->spa_load_state == SPA_LOAD_NONE &&
 	    type == ZIO_TYPE_WRITE && txg != 0 &&
+	    vd->vdev_ops != &vdev_draid_spare_ops &&
 	    (!(flags & ZIO_FLAG_IO_REPAIR) ||
 	    (flags & ZIO_FLAG_SCAN_THREAD) ||
 	    spa->spa_claiming)) {

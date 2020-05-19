@@ -128,6 +128,11 @@ cached configuration and the on-disk configuration.
 If specified multiple times with
 .Fl e
 also display the configuration that would be used were the pool to be imported.
+.Pp
+When displaying a dRAID vdev the permutation groups will by omitted by default.
+They can be fully enumerated in the configuration output by specifying
+.Fl C
+three times.
 .It Fl d
 Display information about datasets.
 Specified once, displays basic dataset information: ID, create transaction,
