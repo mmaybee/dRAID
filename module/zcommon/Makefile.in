@@ -14,6 +14,7 @@ $(MODULE)-objs += cityhash.o
 $(MODULE)-objs += zfeature_common.o
 $(MODULE)-objs += zfs_comutil.o
 $(MODULE)-objs += zfs_deleg.o
+$(MODULE)-objs += zfs_draid.o
 $(MODULE)-objs += zfs_fletcher.o
 $(MODULE)-objs += zfs_fletcher_superscalar.o
 $(MODULE)-objs += zfs_fletcher_superscalar4.o

@@ -71,6 +71,7 @@
 #include <sys/dsl_scan.h>
 #include <sys/btree.h>
 #include <zfs_comutil.h>
+#include <zfs_draid.h>
 
 #include <libnvpair.h>
 #include <libzutil.h>
@@ -1622,7 +1623,11 @@ dump_metaslab(metaslab_t *msp)
 		    SPACE_MAP_HISTOGRAM_SIZE, sm->sm_shift);
 	}
 
-	ASSERT(msp->ms_size == (1ULL << vd->vdev_ms_shift));
+	if (vd->vdev_ops == &vdev_draid_ops)
+		ASSERT3U(msp->ms_size, <=, 1ULL << vd->vdev_ms_shift);
+	else
+		ASSERT3U(msp->ms_size, ==, 1ULL << vd->vdev_ms_shift);
+
 	dump_spacemap(spa->spa_meta_objset, msp->ms_sm);
 
 	if (spa_feature_is_active(spa, SPA_FEATURE_LOG_SPACEMAP)) {
@@ -3747,27 +3752,91 @@ dump_uberblock(uberblock_t *ub, const char *header, const char *footer)
 }
 
 static void
-dump_config(spa_t *spa)
+dump_config_draid_perm_omit(nvlist_t *child)
 {
-	dmu_buf_t *db;
-	size_t nvsize = 0;
-	int error = 0;
+	nvlist_t *draid;
 
+	if (dump_opt['C'] >= 3)
+		return;
 
-	error = dmu_bonus_hold(spa->spa_meta_objset,
-	    spa->spa_config_object, FTAG, &db);
+	if (nvlist_lookup_nvlist(child, ZPOOL_CONFIG_DRAIDCFG, &draid) != 0)
+		return;
 
-	if (error == 0) {
-		nvsize = *(uint64_t *)db->db_data;
-		dmu_buf_rele(db, FTAG);
+	nvlist_remove(draid, ZPOOL_CONFIG_DRAIDCFG_PERM, DATA_TYPE_UINT8_ARRAY);
+	nvlist_add_string(draid, ZPOOL_CONFIG_DRAIDCFG_PERM, "<omitted>");
+}
 
-		(void) printf("\nMOS Configuration:\n");
-		dump_packed_nvlist(spa->spa_meta_objset,
-		    spa->spa_config_object, (void *)&nvsize, 1);
+/*
+ * Dump a pools configuration given the nvroot of the pool.  The label
+ * argument should be set when dumping the configuration from a vdev label.
+ */
+static void
+dump_config_impl(nvlist_t *nvroot, boolean_t label)
+{
+	nvlist_t *dup, *nv;
+
+	dup = fnvlist_dup(nvroot);
+
+	/*
+	 * By default omit printing all the dRAID permutations to avoid
+	 * thousands of lines of normally unwanted output.
+	 */
+	if (label == B_FALSE) {
+		nvlist_t **child;
+		uint_t children;
+
+		if (!nvlist_lookup_nvlist(dup, ZPOOL_CONFIG_VDEV_TREE, &nv) &&
+		    !nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_CHILDREN,
+		    &child, &children)) {
+			for (uint_t c = 0; c < children; c++)
+				dump_config_draid_perm_omit(child[c]);
+		}
 	} else {
+		if (!nvlist_lookup_nvlist(dup, ZPOOL_CONFIG_VDEV_TREE, &nv)) {
+			dump_config_draid_perm_omit(nv);
+		}
+	}
+
+	dump_nvlist(dup, 4);
+	nvlist_free(dup);
+}
+
+static void
+dump_config_from_mos(spa_t *spa)
+{
+	nvlist_t *nvroot;
+	dmu_buf_t *db;
+	int error;
+
+	error = dmu_bonus_hold(spa->spa_meta_objset, spa->spa_config_object,
+	    FTAG, &db);
+	if (error != 0) {
 		(void) fprintf(stderr, "dmu_bonus_hold(%llu) failed, errno %d",
 		    (u_longlong_t)spa->spa_config_object, error);
+		return;
 	}
+
+	size_t nvsize = *(uint64_t *)db->db_data;
+	char *packed = umem_alloc(nvsize, UMEM_NOFAIL);
+
+	dmu_buf_rele(db, FTAG);
+
+	VERIFY0(dmu_read(spa->spa_meta_objset, spa->spa_config_object,
+	    0, nvsize, packed, DMU_READ_PREFETCH));
+	VERIFY0(nvlist_unpack(packed, nvsize, &nvroot, 0));
+	umem_free(packed, nvsize);
+
+	(void) printf("\nMOS Configuration:\n");
+	dump_config_impl(nvroot, B_FALSE);
+
+	nvlist_free(nvroot);
+}
+
+static void
+dump_config_from_cache(spa_t *spa)
+{
+	(void) printf("Cached configuration:\n");
+	dump_config_impl(spa->spa_config, B_FALSE);
 }
 
 static void
@@ -3776,7 +3845,7 @@ dump_cachefile(const char *cachefile)
 	int fd;
 	struct stat64 statbuf;
 	char *buf;
-	nvlist_t *config;
+	nvlist_t *config, *nv;
 
 	if ((fd = open64(cachefile, O_RDONLY)) < 0) {
 		(void) printf("cannot open '%s': %s\n", cachefile,
@@ -3811,7 +3880,14 @@ dump_cachefile(const char *cachefile)
 
 	free(buf);
 
-	dump_nvlist(config, 0);
+	(void) printf("Cache file configuration:\n");
+	for (nvpair_t *pair = nvlist_next_nvpair(config, NULL);
+	    pair != NULL; pair = nvlist_next_nvpair(config, pair)) {
+		if (nvlist_lookup_nvlist(config, nvpair_name(pair), &nv) == 0) {
+			printf("%s:\n", nvpair_name(pair));
+			dump_config_impl(nv, B_FALSE);
+		}
+	}
 
 	nvlist_free(config);
 }
@@ -4329,7 +4405,7 @@ dump_config_from_label(zdb_label_t *label, size_t buflen, int l)
 		return;
 
 	print_label_header(label, l);
-	dump_nvlist(label->config_nv, 4);
+	dump_config_impl(label->config_nv, B_TRUE);
 	print_label_numbers("    labels = ", label->config);
 
 	if (dump_opt['l'] >= 2)
@@ -7326,13 +7402,11 @@ dump_zpool(spa_t *spa)
 		return;
 	}
 
-	if (!dump_opt['e'] && dump_opt['C'] > 1) {
-		(void) printf("\nCached configuration:\n");
-		dump_nvlist(spa->spa_config, 8);
-	}
+	if (!dump_opt['e'] && dump_opt['C'] > 1)
+		dump_config_from_cache(spa);
 
 	if (dump_opt['C'])
-		dump_config(spa);
+		dump_config_from_mos(spa);
 
 	if (dump_opt['u'])
 		dump_uberblock(&spa->spa_uberblock, "\nUberblock:\n", "\n");
@@ -7836,7 +7910,7 @@ zdb_read_block(char *thing, spa_t *spa)
 	DVA_SET_VDEV(&dva[0], vd->vdev_id);
 	DVA_SET_OFFSET(&dva[0], offset);
 	DVA_SET_GANG(&dva[0], !!(flags & ZDB_FLAG_GBH));
-	DVA_SET_ASIZE(&dva[0], vdev_psize_to_asize(vd, psize));
+	DVA_SET_ASIZE(&dva[0], vdev_psize_to_asize(vd, offset, psize));
 
 	BP_SET_BIRTH(bp, TXG_INITIAL, TXG_INITIAL);
 

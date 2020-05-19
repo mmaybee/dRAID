@@ -31,6 +31,7 @@ KERNEL_C = \
 	zfeature_common.c \
 	zfs_comutil.c \
 	zfs_deleg.c \
+	zfs_draid.c \
 	zfs_fletcher.c \
 	zfs_fletcher_aarch64_neon.c \
 	zfs_fletcher_avx512.c \
@@ -117,6 +118,7 @@ KERNEL_C = \
 	unique.c \
 	vdev.c \
 	vdev_cache.c \
+	vdev_draid.c \
 	vdev_file.c \
 	vdev_indirect_births.c \
 	vdev_indirect.c \
@@ -208,7 +210,7 @@ libzpool_la_LIBADD = \
 	$(abs_top_builddir)/lib/libzfs_core/libzfs_core.la \
 	$(abs_top_builddir)/lib/libnvpair/libnvpair.la
 
-libzpool_la_LIBADD += $(LIBCLOCK_GETTIME) $(ZLIB_LIBS) -ldl
+libzpool_la_LIBADD += $(LIBCLOCK_GETTIME) $(ZLIB_LIBS) -ldl -lm
 
 libzpool_la_LDFLAGS = -pthread
 
