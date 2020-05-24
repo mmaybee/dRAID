@@ -221,6 +221,9 @@ is_spare(nvlist_t *config, const char *path)
 	uint_t i, nspares;
 	boolean_t inuse;
 
+	if (vdev_draid_is_spare(path))
+		return (B_TRUE);
+
 	if ((fd = open(path, O_RDONLY|O_DIRECT)) < 0)
 		return (B_FALSE);
 
@@ -269,7 +272,7 @@ is_spare(nvlist_t *config, const char *path)
  *	s*-draid*	Virtual dRAID spare
  */
 static nvlist_t *
-make_leaf_vdev(nvlist_t *props, const char *arg, uint64_t is_log)
+make_leaf_vdev(nvlist_t *props, const char *arg, boolean_t is_primary)
 {
 	char path[MAXPATHLEN];
 	struct stat64 statbuf;
@@ -310,6 +313,13 @@ make_leaf_vdev(nvlist_t *props, const char *arg, uint64_t is_log)
 		/* After whole disk check restore original passed path */
 		strlcpy(path, arg, sizeof (path));
 	} else if (vdev_draid_is_spare(arg)) {
+		if (!is_primary) {
+			(void) fprintf(stderr,
+			    gettext("cannot open '%s': dRAID spares can only "
+			    "be used to replace primary vdevs\n"), arg);
+			return (NULL);
+		}
+
 		wholedisk = B_TRUE;
 		strlcpy(path, arg, sizeof (path));
 		type = VDEV_TYPE_DRAID_SPARE;
@@ -364,10 +374,7 @@ make_leaf_vdev(nvlist_t *props, const char *arg, uint64_t is_log)
 	verify(nvlist_alloc(&vdev, NV_UNIQUE_NAME, 0) == 0);
 	verify(nvlist_add_string(vdev, ZPOOL_CONFIG_PATH, path) == 0);
 	verify(nvlist_add_string(vdev, ZPOOL_CONFIG_TYPE, type) == 0);
-	verify(nvlist_add_uint64(vdev, ZPOOL_CONFIG_IS_LOG, is_log) == 0);
-	if (is_log)
-		verify(nvlist_add_string(vdev, ZPOOL_CONFIG_ALLOCATION_BIAS,
-		    VDEV_ALLOC_BIAS_LOG) == 0);
+
 	if (strcmp(type, VDEV_TYPE_DISK) == 0)
 		verify(nvlist_add_uint64(vdev, ZPOOL_CONFIG_WHOLE_DISK,
 		    (uint64_t)wholedisk) == 0);
@@ -1452,7 +1459,7 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 	nvlist_t *nvroot, *nv, **top, **spares, **l2cache;
 	int t, toplevels, mindev, maxdev, nspares, nlogs, nl2cache;
 	const char *type, *fulltype;
-	uint64_t is_log, is_special, is_dedup;
+	boolean_t is_log, is_special, is_dedup, is_spare;
 	boolean_t seen_logs;
 
 	top = NULL;
@@ -1462,7 +1469,7 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 	nspares = 0;
 	nlogs = 0;
 	nl2cache = 0;
-	is_log = is_special = is_dedup = B_FALSE;
+	is_log = is_special = is_dedup = is_spare = B_FALSE;
 	seen_logs = B_FALSE;
 	nvroot = NULL;
 
@@ -1487,6 +1494,7 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 					    "specified only once\n"));
 					goto spec_out;
 				}
+				is_spare = B_TRUE;
 				is_log = is_special = is_dedup = B_FALSE;
 			}
 
@@ -1500,8 +1508,7 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 				}
 				seen_logs = B_TRUE;
 				is_log = B_TRUE;
-				is_special = B_FALSE;
-				is_dedup = B_FALSE;
+				is_special = is_dedup = is_spare = B_FALSE;
 				argc--;
 				argv++;
 				/*
@@ -1513,8 +1520,7 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 
 			if (strcmp(type, VDEV_ALLOC_BIAS_SPECIAL) == 0) {
 				is_special = B_TRUE;
-				is_log = B_FALSE;
-				is_dedup = B_FALSE;
+				is_log = is_dedup = is_spare = B_FALSE;
 				argc--;
 				argv++;
 				continue;
@@ -1522,8 +1528,7 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 
 			if (strcmp(type, VDEV_ALLOC_BIAS_DEDUP) == 0) {
 				is_dedup = B_TRUE;
-				is_log = B_FALSE;
-				is_special = B_FALSE;
+				is_log = is_special = is_spare = B_FALSE;
 				argc--;
 				argv++;
 				continue;
@@ -1537,7 +1542,8 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 					    "specified only once\n"));
 					goto spec_out;
 				}
-				is_log = is_special = is_dedup = B_FALSE;
+				is_log = is_special = B_FALSE;
+				is_dedup = is_spare = B_FALSE;
 			}
 
 			if (is_log || is_special || is_dedup) {
@@ -1562,7 +1568,8 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 				if (child == NULL)
 					zpool_no_memory();
 				if ((nv = make_leaf_vdev(props, argv[c],
-				    B_FALSE)) == NULL) {
+				    !(is_log || is_special || is_dedup ||
+				    is_spare))) == NULL) {
 					for (c = 0; c < children - 1; c++)
 						nvlist_free(child[c]);
 					free(child);
@@ -1661,12 +1668,19 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 			 * We have a device.  Pass off to make_leaf_vdev() to
 			 * construct the appropriate nvlist describing the vdev.
 			 */
-			if ((nv = make_leaf_vdev(props, argv[0],
-			    is_log)) == NULL)
+			if ((nv = make_leaf_vdev(props, argv[0], !(is_log ||
+			    is_special || is_dedup || is_spare))) == NULL)
 				goto spec_out;
 
-			if (is_log)
+			verify(nvlist_add_uint64(nv,
+			    ZPOOL_CONFIG_IS_LOG, is_log) == 0);
+			if (is_log) {
+				verify(nvlist_add_string(nv,
+				    ZPOOL_CONFIG_ALLOCATION_BIAS,
+				    VDEV_ALLOC_BIAS_LOG) == 0);
 				nlogs++;
+			}
+
 			if (is_special) {
 				verify(nvlist_add_string(nv,
 				    ZPOOL_CONFIG_ALLOCATION_BIAS,
