@@ -7037,14 +7037,19 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	}
 
 	/*
-	 * If we are detaching the original disk from a spare, then it implies
-	 * that the spare should become a real disk, and be removed from the
-	 * active spare list for the pool.
+	 * If we are detaching the original disk from a normal spare, then it
+	 * implies that the spare should become a real disk, and be removed
+	 * from the active spare list for the pool.  dRAID spares are coupled
+	 * to the pool and thus should never be removed from the spares list.
 	 */
-	if (pvd->vdev_ops == &vdev_spare_ops &&
-	    vd->vdev_id == 0 &&
-	    pvd->vdev_child[pvd->vdev_children - 1]->vdev_isspare)
-		unspare = B_TRUE;
+	if (pvd->vdev_ops == &vdev_spare_ops && vd->vdev_id == 0) {
+		vdev_t *last_cvd = pvd->vdev_child[pvd->vdev_children - 1];
+
+		if (last_cvd->vdev_isspare &&
+		    last_cvd->vdev_ops != &vdev_draid_spare_ops) {
+			unspare = B_TRUE;
+		}
+	}
 
 	/*
 	 * Erase the disk labels so the disk can be used for other things.
