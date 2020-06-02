@@ -106,7 +106,6 @@ typedef struct vdev_draid_config {
 	uint64_t *vdc_data;
 	uint64_t *vdc_base_perms;
 	long int vdc_seed;
-	struct abd *vdc_zero_abd;	/* zfs module and libzpool only */
 } vdev_draid_config_t;
 
 /*

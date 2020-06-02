@@ -32,7 +32,6 @@
 #include <sys/zio.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_raidz_impl.h>
-
 #include <zfs_draid.h>
 
 #ifdef  __cplusplus
@@ -45,9 +44,6 @@ extern uint64_t vdev_draid_check_block(const vdev_t *, uint64_t, uint64_t *);
 extern uint64_t vdev_draid_get_astart(const vdev_t *, const uint64_t);
 extern uint64_t vdev_draid_offset_to_group(const vdev_t *, uint64_t);
 extern uint64_t vdev_draid_group_to_offset(const vdev_t *, uint64_t);
-extern void vdev_draid_fix_skip_sectors(zio_t *);
-extern int vdev_draid_hide_skip_sectors(raidz_map_t *);
-extern void vdev_draid_restore_skip_sectors(raidz_map_t *, int);
 extern boolean_t vdev_draid_readable(vdev_t *, uint64_t);
 extern boolean_t vdev_draid_is_dead(vdev_t *, uint64_t);
 extern boolean_t vdev_draid_missing(vdev_t *, uint64_t, uint64_t, uint64_t);
@@ -55,7 +51,7 @@ extern vdev_t *vdev_draid_spare_get_parent(vdev_t *);
 extern nvlist_t *vdev_draid_spare_read_config(vdev_t *);
 extern uint64_t vdev_draid_asize_to_psize(vdev_t *, uint64_t, uint64_t);
 extern uint64_t vdev_draid_max_rebuildable_asize(vdev_t *, uint64_t, uint64_t);
-extern void vdev_draid_debug_zio(zio_t *);
+extern void vdev_draid_map_include_skip_sectors(zio_t *);
 
 #ifdef  __cplusplus
 }

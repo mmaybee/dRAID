@@ -39,50 +39,6 @@
 
 uint64_t vdev_draid_asize_by_type(const vdev_t *, uint64_t, uint64_t);
 
-static void
-vdev_draid_debug_map(raidz_map_t *rm)
-{
-	for (int c = 0; rm != NULL && c < rm->rm_scols; c++) {
-		char t = 'D';
-		raidz_col_t *rc = &rm->rm_col[c];
-		vdev_t *cvd = rm->rm_vdev->vdev_child[rc->rc_devidx];
-
-		if (c >= rm->rm_cols) {
-			t = 'S';
-		} else if (c < rm->rm_firstdatacol) {
-			switch (c) {
-			case 0:
-				t = 'P';
-				break;
-			case 1:
-				t = 'Q';
-				break;
-			case 2:
-				t = 'R';
-				break;
-			default:
-				ASSERT0(c);
-			}
-		}
-
-		zfs_dbgmsg("%c: dev %llu (%s) off %llu, sz %llu, "
-		    "err %d, skipped %d, tried %d", t, rc->rc_devidx,
-		    cvd->vdev_path != NULL ? cvd->vdev_path : "NA",
-		    rc->rc_offset, rc->rc_size,
-		    rc->rc_error, rc->rc_skipped, rc->rc_tried);
-	}
-}
-
-void
-vdev_draid_debug_zio(zio_t *zio)
-{
-	if (zfs_flags & ZFS_DEBUG_DRAID) {
-		zfs_dbgmsg("dRAID zio: off %llu sz %llu data %px",
-		    zio->io_offset, zio->io_size, zio->io_abd);
-		vdev_draid_debug_map(zio->io_vsd);
-	}
-}
-
 /* A child vdev is divided into slices */
 static unsigned int slice_shift = 0;
 #define	DRAID_SLICESHIFT (SPA_MAXBLOCKSHIFT + slice_shift)
@@ -90,123 +46,231 @@ static unsigned int slice_shift = 0;
 #define	DRAID_SLICESIZE  (1ULL << DRAID_SLICESHIFT)
 #define	DRAID_SLICEMASK  (DRAID_SLICESIZE - 1)
 
-static void
-vdev_draid_get_permutation(uint64_t *p, uint64_t nr,
-    const vdev_draid_config_t *vdc)
+/*
+ * Returns the permuted device index for the requested permutation group
+ * and device index.
+ */
+static uint64_t
+vdev_draid_permute_id(vdev_draid_config_t *vdc, uint64_t permutation_id,
+    uint64_t device_id)
 {
 	uint64_t ncols = vdc->vdc_children;
-	uint64_t off = nr % (vdc->vdc_bases * ncols);
+	uint64_t off = permutation_id % (vdc->vdc_bases * ncols);
 	uint64_t base = off / ncols;
 	uint64_t dev = off % ncols;
+	uint64_t *base_perm = vdc->vdc_base_perms + (base * ncols);
 
-	for (uint64_t i = 0; i < ncols; i++) {
-		const uint64_t *base_perm = vdc->vdc_base_perms +
-		    (base * ncols);
+	ASSERT3U(device_id, <, ncols);
 
-		p[i] = (base_perm[i] + dev) % ncols;
+	return ((base_perm[device_id] + dev) % ncols);
+}
+
+/*
+ * Full stripe writes.  For "big columns" it's sufficient to map the correct
+ * range of the zio ABD.  Partial columns require allocating a gang ABD in
+ * order to zero fill the skip sectors.  When the column is empty a zero
+ * filled skip sector must be mapped.  In all cases the data ABDs must be
+ * the same size as the parity ABDs.
+ *
+ * Both rm->cols and rc->rc_size are increased to calculate the parity over
+ * the full stripe width.  All zero filled skip sectors must be written to
+ * disk for the benefit of the device rebuild feature which is unaware of
+ * individual block bounderies.
+ */
+static void
+vdev_draid_map_alloc_write(zio_t *zio, raidz_map_t *rm)
+{
+	uint64_t skip_size = 1ULL << zio->io_vd->vdev_top->vdev_ashift;
+	uint64_t abd_off = 0;
+
+	ASSERT3U(zio->io_type, ==, ZIO_TYPE_WRITE);
+
+	for (uint64_t c = rm->rm_firstdatacol; c < rm->rm_scols; c++) {
+		raidz_col_t *rc = &rm->rm_col[c];
+
+		if (rm->rm_skipstart == 0 || c < rm->rm_skipstart) {
+			rc->rc_abd = abd_get_offset_size(zio->io_abd,
+			    abd_off, rc->rc_size);
+		} else if (c < rm->rm_cols) {
+			rc->rc_abd = abd_alloc_gang_abd();
+			abd_gang_add(rc->rc_abd, abd_get_offset_size(
+			    zio->io_abd, abd_off, rc->rc_size), B_TRUE);
+			abd_gang_add(rc->rc_abd, abd_get_zeros(skip_size),
+			    B_TRUE);
+		} else {
+			rc->rc_abd = abd_get_zeros(skip_size);
+		}
+
+		uint64_t abd_size = abd_get_size(rc->rc_abd);
+		ASSERT3U(abd_size, ==, abd_get_size(rm->rm_col[0].rc_abd));
+
+		abd_off += rc->rc_size;
+		rc->rc_size = abd_size;
+	}
+
+	rm->rm_cols = rm->rm_scols;
+}
+
+/*
+ * Scrub/resilver reads.  In order to store the contents of the skip sectors
+ * an additional ABD is allocated.  The columns are handled in the same way
+ * as a full stripe write except instead of using the zero ABD the newly
+ * allocated skip ABD is used the back the skip sectors.  In all cases the
+ * data ABD must be the same size as the parity ABDs.
+ *
+ * Both the rm->rm_cols and rc->rc_size are increased to allow the parity
+ * to be calculated for the stripe.
+ */
+static void
+vdev_draid_map_alloc_scrub(zio_t *zio, raidz_map_t *rm)
+{
+	uint64_t skip_size = 1ULL << zio->io_vd->vdev_top->vdev_ashift;
+	uint64_t abd_off = 0;
+
+	ASSERT3U(zio->io_type, ==, ZIO_TYPE_READ);
+
+	rm->rm_abd_skip = abd_alloc_linear(rm->rm_nskip * skip_size, B_TRUE);
+
+	for (uint64_t c = rm->rm_firstdatacol; c < rm->rm_scols; c++) {
+		raidz_col_t *rc = &rm->rm_col[c];
+		int skip_idx = c - rm->rm_skipstart;
+
+		if (rm->rm_skipstart == 0 || c < rm->rm_skipstart) {
+			rc->rc_abd = abd_get_offset_size(zio->io_abd,
+			    abd_off, rc->rc_size);
+		} else if (c < rm->rm_cols) {
+			rc->rc_abd = abd_alloc_gang_abd();
+			abd_gang_add(rc->rc_abd, abd_get_offset_size(
+			    zio->io_abd, abd_off, rc->rc_size), B_TRUE);
+			abd_gang_add(rc->rc_abd, abd_get_offset_size(
+			    rm->rm_abd_skip, skip_idx * skip_size, skip_size),
+			    B_TRUE);
+		} else {
+			rc->rc_abd = abd_get_offset_size(rm->rm_abd_skip,
+			    skip_idx * skip_size, skip_size);
+		}
+
+		uint64_t abd_size = abd_get_size(rc->rc_abd);
+		ASSERT3U(abd_size, ==, abd_get_size(rm->rm_col[0].rc_abd));
+
+		abd_off += rc->rc_size;
+		rc->rc_size = abd_size;
+	}
+
+	rm->rm_cols = rm->rm_scols;
+}
+
+/*
+ * Normal reads.  This is the common case, it is sufficent to map the zio's
+ * ABD in to the raid map columns.  If the checksum cannot be verified the
+ * raid map is expanded by vdev_draid_map_include_skip_sectors() to allow
+ * reconstruction from parity data.
+ */
+static void
+vdev_draid_map_alloc_read(zio_t *zio, raidz_map_t *rm)
+{
+	uint64_t abd_off = 0;
+
+	ASSERT3U(zio->io_type, ==, ZIO_TYPE_READ);
+
+	for (uint64_t c = rm->rm_firstdatacol; c < rm->rm_cols; c++) {
+		raidz_col_t *rc = &rm->rm_col[c];
+
+		rc->rc_abd = abd_get_offset_size(zio->io_abd, abd_off,
+		    rc->rc_size);
+		abd_off += rc->rc_size;
 	}
 }
 
-noinline static raidz_map_t *
-vdev_draid_map_alloc(zio_t *zio, uint64_t **array)
+/*
+ * Allocate the raidz mapping to be applied to the dRAID I/O.  The parity
+ * calculations for dRAID are identical to raidz.  The only caveat is that
+ * dRAID always allocates a full stripe width.  Zero filled skip sectors
+ * are added to pad out the buffer and must be written to disk.
+ */
+static raidz_map_t *
+vdev_draid_map_alloc(zio_t *zio)
 {
 	vdev_t *vd = zio->io_vd;
-	const vdev_draid_config_t *vdc = vd->vdev_tsd;
-	const uint64_t unit_shift = vd->vdev_top->vdev_ashift;
-	const uint64_t ngroups = vdc->vdc_groups;
-	const uint64_t nparity = vdc->vdc_parity;
-	const uint64_t nspare = vdc->vdc_spares;
-	const uint64_t ncols = vdc->vdc_children;
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
+
 	/* The starting dRAID (parent) vdev sector of the block. */
-	const uint64_t b = zio->io_offset >> unit_shift;
+	const uint64_t ashift = vd->vdev_top->vdev_ashift;
+	const uint64_t b = zio->io_offset >> ashift;
+
 	/* The zio's size in units of the vdev's minimum sector size. */
-	const uint64_t psize = zio->io_size >> unit_shift;
-	const uint64_t slice = DRAID_SLICESIZE >> unit_shift;
-	uint64_t o, q, r, c, bc, acols, asize, tot, ndata = 0;
-	uint64_t perm, group, offset, groupsz = 0, groupstart, abd_off;
-	raidz_map_t *rm;
-	uint64_t *permutation;
+	const uint64_t psize = zio->io_size >> ashift;
+	const uint64_t slice = DRAID_SLICESIZE >> ashift;
 
-	ASSERT0(P2PHASE(DRAID_SLICESIZE, 1ULL << unit_shift));
+	/*
+	 * Figure out in which group the IO will fall and use it to set the
+	 * group start index, group size and number of data columns.  Tha
+	 * offset is converted to a sector offset within this group chunk.
+	 */
+	uint64_t groupstart = 0;
+	uint64_t groupsz = 0;
+	uint64_t ndata = 0;
+	uint64_t offset = b % ((vdc->vdc_children - vdc->vdc_spares) * slice);
 
-	/* HH: may not actually need the nspare columns for normal IO */
-	permutation = kmem_alloc(sizeof (permutation[0]) * ncols, KM_SLEEP);
-
-	perm = b / ((ncols - nspare) * slice);
-	offset = b % ((ncols - nspare) * slice);
-	/* Figure out in which group the IO will fall */
-	for (group = 0, groupstart = 0; group < ngroups; group++) {
+	for (uint64_t group = 0; group < vdc->vdc_groups; group++) {
 		ndata = vdc->vdc_data[group];
-		groupsz = ndata + nparity;
+		groupsz = ndata + vdc->vdc_parity;
 		uint64_t span = groupsz * slice;
 		if (offset < span)
 			break;
 		offset -= span;
 		groupstart += groupsz;
 	}
-	ASSERT3U(group, <, ngroups);
-	ASSERT3U(group, ==,
-	    vdev_draid_offset_to_group(vd, zio->io_offset) % ngroups);
 
-	/* offset is now a sector offset within this group chunk */
+	ASSERT3U(groupsz, >, 0);
 	ASSERT0(offset % groupsz);
-	ASSERT3U(groupstart + groupsz, <=, ncols - nspare);
+	ASSERT3U(groupstart + groupsz, <=, vdc->vdc_children - vdc->vdc_spares);
 
 	/* The starting byte offset on each child vdev. */
-	o = (perm * slice + offset / groupsz) << unit_shift;
+	uint64_t perm = b / ((vdc->vdc_children - vdc->vdc_spares) * slice);
+	uint64_t o = (perm * slice + offset / groupsz) << ashift;
 
 	/*
 	 * "Quotient": The number of data sectors for this stripe on all but
 	 * the "big column" child vdevs that also contain "remainder" data.
 	 */
-	q = psize / ndata;
+	uint64_t q = psize / ndata;
 
 	/*
 	 * "Remainder": The number of partial stripe data sectors in this I/O.
 	 * This will add a sector to some, but not all, child vdevs.
 	 */
-	r = psize - q * ndata;
+	uint64_t r = psize - q * ndata;
 
 	/* The number of "big columns" - those which contain remainder data. */
-	bc = (r == 0 ? 0 : r + nparity);
+	uint64_t bc = (r == 0 ? 0 : r + vdc->vdc_parity);
 	ASSERT3U(bc, <, groupsz);
 
-	/*
-	 * The total number of data and parity sectors associated with
-	 * this I/O.
-	 */
-	tot = psize + (nparity * (q + (r == 0 ? 0 : 1)));
+	/* The total number of data and parity sectors for this I/O. */
+	uint64_t tot = psize + (vdc->vdc_parity * (q + (r == 0 ? 0 : 1)));
 
-	/* acols: The columns that will be accessed. */
-	if (q == 0) {
-		/* Our I/O request doesn't span all child vdevs. */
-		acols = bc;
-	} else {
-		acols = groupsz;
-	}
+	raidz_map_t *rm = kmem_alloc(offsetof(raidz_map_t, rm_col[groupsz]),
+	    KM_SLEEP);
 
-	rm = kmem_alloc(offsetof(raidz_map_t, rm_col[groupsz]), KM_SLEEP);
-	rm->rm_cols = acols;
+	rm->rm_cols = (q == 0) ? bc : groupsz;
 	rm->rm_scols = groupsz;
 	rm->rm_bigcols = bc;
 	rm->rm_skipstart = bc;
 	rm->rm_missingdata = 0;
 	rm->rm_missingparity = 0;
-	rm->rm_firstdatacol = nparity;
+	rm->rm_firstdatacol = vdc->vdc_parity;
 	rm->rm_abd_copy = NULL;
+	rm->rm_abd_skip = NULL;
 	rm->rm_reports = 0;
 	rm->rm_freed = 0;
 	rm->rm_ecksuminjected = 0;
-	rm->rm_vdev = vd;
+	rm->rm_include_skip = 1;
 
-	vdev_draid_get_permutation(permutation, perm, vdc);
-
-	for (c = 0, asize = 0; c < groupsz; c++) {
+	uint64_t asize = 0;
+	for (uint64_t c = 0; c < groupsz; c++) {
 		uint64_t i = groupstart + c;
 
-		ASSERT3U(i, <, ncols - nspare);
-
-		rm->rm_col[c].rc_devidx = permutation[i];
+		rm->rm_col[c].rc_devidx = vdev_draid_permute_id(vdc, perm, i);
 		rm->rm_col[c].rc_offset = o;
 		rm->rm_col[c].rc_abd = NULL;
 		rm->rm_col[c].rc_gdata = NULL;
@@ -214,53 +278,68 @@ vdev_draid_map_alloc(zio_t *zio, uint64_t **array)
 		rm->rm_col[c].rc_tried = 0;
 		rm->rm_col[c].rc_skipped = 0;
 
-		if (c >= acols)
+		if (c >= rm->rm_cols)
 			rm->rm_col[c].rc_size = 0;
 		else if (c < bc)
-			rm->rm_col[c].rc_size = (q + 1) << unit_shift;
+			rm->rm_col[c].rc_size = (q + 1) << ashift;
 		else
-			rm->rm_col[c].rc_size = q << unit_shift;
+			rm->rm_col[c].rc_size = q << ashift;
 
 		asize += rm->rm_col[c].rc_size;
 	}
 
-	ASSERT3U(asize, ==, tot << unit_shift);
-	rm->rm_asize = roundup(asize, groupsz << unit_shift);
+	ASSERT3U(asize, ==, tot << ashift);
+	rm->rm_asize = roundup(asize, groupsz << ashift);
 	rm->rm_nskip = roundup(tot, groupsz) - tot;
-	ASSERT3U(rm->rm_asize - asize, ==, rm->rm_nskip << unit_shift);
+	ASSERT3U(rm->rm_asize - asize, ==, rm->rm_nskip << ashift);
 	ASSERT3U(rm->rm_nskip, <, ndata);
 
-	/* allocate a buffer if we have a rounding gap */
-	if (rm->rm_nskip == 0 ||
-	    (zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER)) == 0)
-		rm->rm_abd_skip = NULL;
-	else
-		rm->rm_abd_skip =
-		    abd_alloc_linear(rm->rm_nskip << unit_shift, B_TRUE);
-
-	/* allocate buffers for parity */
-	for (c = 0; c < rm->rm_firstdatacol; c++)
-		rm->rm_col[c].rc_abd =
-		    abd_alloc_linear(rm->rm_col[c].rc_size, B_TRUE);
-
-	/* create buffers for the data chunks */
-	abd_off = 0;
-	ASSERT3U(c, <, acols);
-	for (; c < acols; c++) {
-		rm->rm_col[c].rc_abd = abd_get_offset_size(zio->io_abd,
-		    abd_off, rm->rm_col[c].rc_size);
-		abd_off += rm->rm_col[c].rc_size;
+	/* Allocate buffers for the parity columns */
+	for (uint64_t c = 0; c < rm->rm_firstdatacol; c++) {
+		raidz_col_t *rc = &rm->rm_col[c];
+		rc->rc_abd = abd_alloc_linear(rc->rc_size, B_TRUE);
 	}
 
-	if (array == NULL)
-		kmem_free(permutation, sizeof (permutation[0]) * ncols);
-	else
-		*array = permutation; /* caller will free */
+	/*
+	 * Map buffers for data columns and allocate/map buffers for skip
+	 * sectors.  There are three distinct cases for dRAID which are
+	 * required to support sequential rebuild.
+	 */
+	if (zio->io_type == ZIO_TYPE_WRITE) {
+		vdev_draid_map_alloc_write(zio, rm);
+	} else if ((rm->rm_nskip > 0) &&
+	    (zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER))) {
+		vdev_draid_map_alloc_scrub(zio, rm);
+	} else {
+		vdev_draid_map_alloc_read(zio, rm);
+	}
 
 	rm->rm_ops = vdev_raidz_math_get_ops();
 	zio->io_vsd = rm;
 	zio->io_vsd_ops = &vdev_raidz_vsd_ops;
+
 	return (rm);
+}
+
+/*
+ * Converts a dRAID read raidz_map_t to a dRAID scrub raidz_map_t.  The
+ * key difference is that and ABD is allocated to back to skip sectors
+ * so they may be read, verified, and repaired if needed.
+ */
+void
+vdev_draid_map_include_skip_sectors(zio_t *zio)
+{
+	raidz_map_t *rm = zio->io_vsd;
+
+	ASSERT3U(zio->io_type, ==, ZIO_TYPE_READ);
+	ASSERT3P(rm->rm_abd_skip, ==, NULL);
+
+	for (uint64_t c = rm->rm_firstdatacol; c < rm->rm_cols; c++) {
+		ASSERT(!abd_is_gang(rm->rm_col[c].rc_abd));
+		abd_put(rm->rm_col[c].rc_abd);
+	}
+
+	vdev_draid_map_alloc_scrub(zio, rm);
 }
 
 static inline uint64_t
@@ -510,19 +589,19 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	boolean_t degraded = B_FALSE;
 	zio_t *zio;
 	int dummy_data;
-	uint64_t *perm;
 	char buf[128];
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
 	zio = kmem_alloc(sizeof (*zio), KM_SLEEP);
 	zio->io_vd = vd;
+	zio->io_type = ZIO_TYPE_READ;
 	zio->io_offset = offset;
 	zio->io_size = MAX(SPA_MINBLOCKSIZE, 1ULL << ashift);
 	zio->io_abd = abd_get_from_buf(&dummy_data, zio->io_size);
 
 	buf[0] = '\0';
-	raidz_map_t *rm = vdev_draid_map_alloc(zio, &perm);
+	raidz_map_t *rm = vdev_draid_map_alloc(zio);
 
 	uint64_t group __maybe_unused = vdev_draid_offset_to_group(vd, offset);
 	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, offset + size - 1));
@@ -548,18 +627,19 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	if (zfs_flags & ZFS_DEBUG_DRAID) {
 		snprintf(buf + strlen(buf), sizeof (buf) - strlen(buf),
 		    "spares: ");
-		for (int c = 0; c < vdc->vdc_spares; c++)
+		for (int c = 0; c < vdc->vdc_spares; c++) {
 			snprintf(buf + strlen(buf),
 			    sizeof (buf) - strlen(buf), "%llu",
-			    (u_longlong_t)perm[vdc->vdc_children - 1 - c]);
+			    (u_longlong_t)vdev_draid_permute_id(vdc,
+			    offset >> DRAID_SLICESHIFT,
+			    vdc->vdc_children - 1 - c));
+		}
 
 		zfs_dbgmsg("%s dRAID, fault_guid=%llu, at %lluK of %lluK: %s",
 		    degraded ? "Degraded" : "Healthy",
 		    fault_vdev ? (u_longlong_t)fault_vdev->vdev_guid : 0,
 		    offset >> 10, size >> 10, buf);
 	}
-
-	kmem_free(perm, sizeof (perm[0]) * vdc->vdc_children);
 
 	(*zio->io_vsd_ops->vsd_free)(zio);
 
@@ -621,7 +701,6 @@ vdev_draid_config_create(vdev_t *vd)
 	    ZPOOL_CONFIG_DRAIDCFG_PERM, &perms, &c));
 
 	vdc->vdc_base_perms = vdev_draid_create_base_perms(perms, vdc);
-	vdc->vdc_zero_abd = NULL;
 
 	return (vdc);
 }
@@ -692,16 +771,6 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 		}
 	}
 
-	if (vdc->vdc_zero_abd == NULL) {
-		abd_t *zabd;
-		size_t sz = 1ULL << MAX(*ashift, vd->vdev_ashift);
-
-		zabd = abd_alloc_linear(sz, B_TRUE);
-		abd_zero(zabd, sz);
-
-		vdc->vdc_zero_abd = zabd;
-	}
-
 	*asize *= vd->vdev_children - vdc->vdc_spares;
 	*max_asize *= vd->vdev_children - vdc->vdc_spares;
 
@@ -718,7 +787,6 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 static void
 vdev_draid_close(vdev_t *vd)
 {
-	abd_t *zabd;
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
 	for (int c = 0; c < vd->vdev_children; c++)
@@ -726,10 +794,6 @@ vdev_draid_close(vdev_t *vd)
 
 	if (vd->vdev_reopening || vdc == NULL)
 		return;
-
-	zabd = vdc->vdc_zero_abd;
-	ASSERT(zabd != NULL);
-	abd_free(zabd);
 
 	vdev_draid_config_destroy(vdc);
 	vd->vdev_tsd = NULL;
@@ -851,15 +915,6 @@ vdev_draid_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
 	return (vdev_draid_group_degraded(vd, NULL, offset, psize));
 }
 
-static void
-vdev_draid_skip_io_done(zio_t *zio)
-{
-	/*
-	 * HH: handle skip IO error
-	 * raidz_col_t *rc = zio->io_private;
-	 */
-}
-
 /*
  * Start an IO operation on a dRAID VDev
  *
@@ -867,59 +922,39 @@ vdev_draid_skip_io_done(zio_t *zio)
  * - For write operations:
  *   1. Generate the parity data
  *   2. Create child zio write operations to each column's vdev, for both
- *      data and parity.
- *   3. If the column skips any sectors for padding, create optional dummy
- *      write zio children for those areas to improve aggregation continuity.
+ *      data and parity.  A gang ABD is allocated by vdev_draid_map_alloc()
+ *      if a skip sector needs to be added to a column.
  * - For read operations:
- *   1. Create child zio read operations to each data column's vdev to read
- *      the range of data required for zio.
- *   2. If this is a scrub or resilver operation, or if any of the data
- *      vdevs have had errors, then create zio read operations to the parity
- *      columns' VDevs as well.
+ *   1. The vdev_draid_map_alloc() function will create a minimal raidz
+ *      mapping for the read based on the zio->io_flags.  There are two
+ *      possible mappings either 1) a normal read, or 2) a scrub/resilver.
+ *   2. Create the zio read operations.  This will include all parity
+ *      columns and skip sectors for a scrub/resilver.
  */
 static void
 vdev_draid_io_start(zio_t *zio)
 {
 	vdev_t *vd = zio->io_vd;
-	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	vdev_t *cvd;
 	raidz_map_t *rm;
-	raidz_col_t *rc;
-	int c, i;
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	rm = vdev_draid_map_alloc(zio, NULL);
-	ASSERT3U(rm->rm_asize, ==,
-	    vdev_draid_asize_by_type(vd, zio->io_offset, zio->io_size));
+	rm = vdev_draid_map_alloc(zio);
 
-	/* XXX - should construct a meta-abd with skip abd at end */
 	if (zio->io_type == ZIO_TYPE_WRITE) {
 		vdev_raidz_generate_parity(rm);
 
-		for (c = 0; c < rm->rm_cols; c++) {
-			rc = &rm->rm_col[c];
-			cvd = vd->vdev_child[rc->rc_devidx];
+		/*
+		 * Unlike raidz, skip sectors are zero filled and all
+		 * columns must always be written.
+		 */
+		for (int c = 0; c < rm->rm_scols; c++) {
+			raidz_col_t *rc = &rm->rm_col[c];
+			vdev_t *cvd = vd->vdev_child[rc->rc_devidx];
 			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
 			    rc->rc_offset, rc->rc_abd, rc->rc_size,
 			    zio->io_type, zio->io_priority, 0,
 			    vdev_raidz_child_done, rc));
-		}
-
-		/*
-		 * Unlike raidz, it's mandatory to fill skip sectors with zero.
-		 */
-		for (c = rm->rm_skipstart, i = 0; i < rm->rm_nskip; c++, i++) {
-			ASSERT3U(c, <, rm->rm_scols);
-			ASSERT3U(c, >, rm->rm_firstdatacol);
-
-			rc = &rm->rm_col[c];
-			cvd = vd->vdev_child[rc->rc_devidx];
-			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
-			    rc->rc_offset + rc->rc_size, vdc->vdc_zero_abd,
-			    1ULL << ashift, zio->io_type, zio->io_priority,
-			    0, vdev_draid_skip_io_done, rc));
 		}
 
 		zio_execute(zio);
@@ -928,29 +963,34 @@ vdev_draid_io_start(zio_t *zio)
 
 	ASSERT(zio->io_type == ZIO_TYPE_READ);
 
-	/*
-	 * Sequential rebuild must do IO at redundancy group boundary,
-	 * i.e. rm->rm_nskip must be 0.
-	 */
+	/* Scrub/resilver must verify skip sectors, expanded raidz map */
+	IMPLY(zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER),
+	    rm->rm_cols == rm->rm_scols);
+
+	/* Sequential rebuild must do IO at redundancy group boundary. */
 	IMPLY(zio->io_priority == ZIO_PRIORITY_REBUILD, rm->rm_nskip == 0);
 
 	/*
 	 * Iterate over the columns in reverse order so that we hit the parity
-	 * last -- any errors along the way will force us to read the parity.
+	 * last.  Any errors along the way will force us to read the parity.
+	 * For scrub/resilver IOs which verify skip sectors a gang ABD will
+	 * have been allocated to store them and rc->rc_size_increased.
 	 */
-	for (c = rm->rm_cols - 1; c >= 0; c--) {
-		rc = &rm->rm_col[c];
-		cvd = vd->vdev_child[rc->rc_devidx];
+	for (int c = rm->rm_cols - 1; c >= 0; c--) {
+		raidz_col_t *rc = &rm->rm_col[c];
+		vdev_t *cvd = vd->vdev_child[rc->rc_devidx];
+
 		if (!vdev_draid_readable(cvd, rc->rc_offset)) {
 			if (c >= rm->rm_firstdatacol)
 				rm->rm_missingdata++;
 			else
 				rm->rm_missingparity++;
 			rc->rc_error = SET_ERROR(ENXIO);
-			rc->rc_tried = 1;	/* don't even try */
+			rc->rc_tried = 1;
 			rc->rc_skipped = 1;
 			continue;
 		}
+
 		if (vdev_draid_missing(cvd, rc->rc_offset, zio->io_txg, 1)) {
 			if (c >= rm->rm_firstdatacol)
 				rm->rm_missingdata++;
@@ -960,6 +1000,7 @@ vdev_draid_io_start(zio_t *zio)
 			rc->rc_skipped = 1;
 			continue;
 		}
+
 		if (c >= rm->rm_firstdatacol || rm->rm_missingdata > 0 ||
 		    (zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER))) {
 			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
@@ -969,146 +1010,13 @@ vdev_draid_io_start(zio_t *zio)
 		}
 	}
 
-	/*
-	 * Check skip sectors for scrub/resilver. For sequential rebuild,
-	 * this is a no-op because rm->rm_nskip is always zero.
-	 */
-	if ((zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER))) {
-		for (c = rm->rm_skipstart, i = 0; i < rm->rm_nskip; c++, i++) {
-			abd_t *abd;
-
-			ASSERT3U(c, <, rm->rm_scols);
-			ASSERT3U(c, >, rm->rm_firstdatacol);
-
-			rc = &rm->rm_col[c];
-			cvd = vd->vdev_child[rc->rc_devidx];
-
-			if (!vdev_draid_readable(cvd,
-			    rc->rc_offset + rc->rc_size)) {
-				rc->rc_abd_skip = NULL;
-				continue;
-			}
-
-			abd = abd_get_offset_size(rm->rm_abd_skip,
-			    i << ashift, 1ULL << ashift);
-			*((int *)abd_to_buf(abd)) = 1;
-			rc->rc_abd_skip = abd;
-
-			/* Skip sector to be written in vdev_draid_io_done() */
-			if (vdev_draid_missing(cvd,
-			    rc->rc_offset + rc->rc_size, zio->io_txg, 1))
-				continue;
-
-			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
-			    rc->rc_offset + rc->rc_size, abd,
-			    1ULL << ashift, ZIO_TYPE_READ,
-			    zio->io_priority, 0, vdev_draid_skip_io_done, rc));
-		}
-	}
-
 	zio_execute(zio);
-}
-
-int
-vdev_draid_hide_skip_sectors(raidz_map_t *rm)
-{
-	size_t size = rm->rm_col[0].rc_size;
-	vdev_t *vd = rm->rm_vdev;
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	int cols;
-
-	ASSERT(vdev_raidz_map_declustered(rm));
-
-	for (int c = rm->rm_cols; c < rm->rm_scols; c++) {
-		raidz_col_t *rc = &rm->rm_col[c];
-
-		ASSERT0(rc->rc_size);
-		ASSERT0(rc->rc_error);
-		ASSERT0(rc->rc_tried);
-		ASSERT0(rc->rc_skipped);
-		ASSERT(rc->rc_abd == NULL);
-
-		rc->rc_size = size;
-		rc->rc_abd = vdc->vdc_zero_abd;
-	}
-
-	cols = rm->rm_cols;
-	rm->rm_cols = rm->rm_scols;
-	return (cols);
-}
-
-void
-vdev_draid_restore_skip_sectors(raidz_map_t *rm, int cols)
-{
-	int c;
-
-	ASSERT3U(cols, >, rm->rm_firstdatacol);
-	ASSERT3U(cols, <=, rm->rm_scols);
-	ASSERT(vdev_raidz_map_declustered(rm));
-
-	for (c = cols; c < rm->rm_scols; c++) {
-		raidz_col_t *rc = &rm->rm_col[c];
-
-		ASSERT0(rc->rc_error);
-		ASSERT0(rc->rc_tried);
-		ASSERT0(rc->rc_skipped);
-		ASSERT(rc->rc_abd != NULL);
-
-		rc->rc_size = 0;
-		rc->rc_abd = NULL;
-	}
-
-	rm->rm_cols = cols;
-}
-
-void
-vdev_draid_fix_skip_sectors(zio_t *zio)
-{
-	int c, i;
-	char *zero;
-	vdev_t *vd = zio->io_vd;
-	raidz_map_t *rm = zio->io_vsd;
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	const uint64_t size = 1ULL << vd->vdev_top->vdev_ashift;
-
-	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
-	ASSERT3P(rm->rm_vdev, ==, vd);
-
-	if (rm->rm_abd_skip == NULL)
-		return;
-
-	zero = abd_to_buf(vdc->vdc_zero_abd);
-	for (c = rm->rm_skipstart, i = 0; i < rm->rm_nskip; c++, i++) {
-		char *skip;
-		boolean_t good_skip;
-		raidz_col_t *rc = &rm->rm_col[c];
-
-		ASSERT3U(c, <, rm->rm_scols);
-		ASSERT3U(c, >, rm->rm_firstdatacol);
-
-		if (rc->rc_abd_skip == NULL)
-			continue;
-
-		skip = abd_to_buf(rc->rc_abd_skip);
-		good_skip = (memcmp(skip, zero, size) == 0);
-		abd_put(rc->rc_abd_skip);
-		rc->rc_abd_skip = NULL;
-
-		if (good_skip || !spa_writeable(zio->io_spa))
-			continue;
-
-		zio_nowait(zio_vdev_child_io(zio, NULL,
-		    vd->vdev_child[rc->rc_devidx],
-		    rc->rc_offset + rc->rc_size, vdc->vdc_zero_abd,
-		    size, ZIO_TYPE_WRITE, ZIO_PRIORITY_ASYNC_WRITE,
-		    ZIO_FLAG_IO_REPAIR, NULL, NULL));
-	}
 }
 
 static void
 vdev_draid_io_done(zio_t *zio)
 {
-	vdev_raidz_ops.vdev_op_io_done(zio);
+	vdev_raidz_io_done(zio);
 }
 
 static void
@@ -1224,6 +1132,7 @@ vdev_dspare_get_child(vdev_t *vd, uint64_t offset)
 {
 	vdev_draid_spare_t *vds = vd->vdev_tsd;
 	vdev_draid_config_t *vdc;
+	uint64_t spare_id;
 	vdev_t *tvd;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
@@ -1232,18 +1141,15 @@ vdev_dspare_get_child(vdev_t *vd, uint64_t offset)
 	ASSERT(vds != NULL);
 
 	tvd = vds->vds_draid_vdev;
-	ASSERT3P(tvd->vdev_ops, ==, &vdev_draid_ops);
 	vdc = tvd->vdev_tsd;
 
+	ASSERT3P(tvd->vdev_ops, ==, &vdev_draid_ops);
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
 
-	uint64_t *perm, spare_idx;
-	perm = kmem_alloc(sizeof (perm[0]) * tvd->vdev_children, KM_SLEEP);
-	vdev_draid_get_permutation(perm, offset >> DRAID_SLICESHIFT, vdc);
-	spare_idx = perm[(tvd->vdev_children - 1) - vds->vds_spare_id];
-	kmem_free(perm, sizeof (perm[0]) * tvd->vdev_children);
+	spare_id = vdev_draid_permute_id(vdc, offset >> DRAID_SLICESHIFT,
+	    (tvd->vdev_children - 1) - vds->vds_spare_id);
 
-	return (tvd->vdev_child[spare_idx]);
+	return (tvd->vdev_child[spare_id]);
 }
 
 vdev_t *
@@ -1343,13 +1249,12 @@ vdev_dspare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	vdc = tvd->vdev_tsd;
 
 	/* Spare name references a known top-level dRAID vdev */
-	if (tvd->vdev_ops != &vdev_draid_ops || tvd->vdev_nparity != parity)
+	if (tvd->vdev_ops != &vdev_draid_ops || vdc == NULL)
 		return (SET_ERROR(EINVAL));
 
 	/* Spare name dDRAID settings agree with top-level dRAID vdev */
-	if (vdc == NULL || vdc->vdc_parity != parity ||
-	    vdc->vdc_groups != groups || vdc->vdc_spares != spares ||
-	    vdc->vdc_spares <= spare_id) {
+	if (vdc->vdc_parity != parity || vdc->vdc_groups != groups ||
+	    vdc->vdc_spares != spares || vdc->vdc_spares <= spare_id) {
 		return (SET_ERROR(EINVAL));
 	}
 
@@ -1359,7 +1264,7 @@ vdev_dspare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	vd->vdev_tsd = vds;
 
 skip_open:
-	asize = tvd->vdev_asize / (tvd->vdev_children - vdc->vdc_spares);
+	asize = tvd->vdev_asize / (tvd->vdev_children - spares);
 
 	/* If parent max_asize not yet set, use asize */
 	if (tvd->vdev_max_asize == 0) {
@@ -1433,12 +1338,12 @@ vdev_dspare_io_start(zio_t *zio)
 
 	if (offset < VDEV_LABEL_START_SIZE ||
 	    offset >= vd->vdev_psize - VDEV_LABEL_END_SIZE) {
-		ASSERT(zio->io_flags & ZIO_FLAG_PHYSICAL);
-
 		/*
 		 * HH: dspare should not get any label IO as it is pretending
 		 * to be a leaf disk. Later should catch and fix all places
 		 * that still does label IO to dspare.
+		 *
+		 * ASSERT(zio->io_flags & ZIO_FLAG_PHYSICAL);
 		 */
 		zio->io_error = SET_ERROR(EIO);
 		zio_interrupt(zio);
@@ -1463,6 +1368,7 @@ vdev_dspare_io_start(zio_t *zio)
 	/* dspare IO does not cross slice boundary */
 	ASSERT3U(offset >> DRAID_SLICESHIFT, ==,
 	    (offset + zio->io_size - 1) >> DRAID_SLICESHIFT);
+
 	zio_nowait(zio_vdev_child_io(zio, NULL, cvd, offset, zio->io_abd,
 	    zio->io_size, zio->io_type, zio->io_priority, 0,
 	    vdev_dspare_child_done, zio));

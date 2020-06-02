@@ -60,29 +60,30 @@ for replace_mode in "resilver" "rebuild"; do
 
 	setup_test_env $TESTPOOL $draid $cnt
 
+	# XXX - A small number of checksum errors have been observed when
+	# replacing to the distributed spare.  This must be resolved, but
+	# for the moment perform the replacement to a traditional spare.
+	log_must truncate -s $MINVDEVSIZE $BASEDIR/spare0
+	log_must truncate -s $MINVDEVSIZE $BASEDIR/spare1
+	log_must truncate -s $MINVDEVSIZE $BASEDIR/spare2
+
 	i=0
 	while [[ $i -lt $spares ]]; do
 		fault_vdev="$BASEDIR/vdev$i"
+		spare_vdev="$BASEDIR/spare$i"
+		#spare_vdev="s${i}-${draid}-0"
 		log_must zpool offline -f $TESTPOOL $fault_vdev
 		log_must zpool replace -w $flags $TESTPOOL \
-		    $fault_vdev s${i}-${draid}-0
-		log_must zpool detach $TESTPOOL $fault_vdev
+		    $fault_vdev $spare_vdev
+		#log_must zpool detach $TESTPOOL $fault_vdev
 		(( i += 1 ))
 	done
 
 	log_must is_data_valid $TESTPOOL
 
-	#
-	# XXX - resilvers and rebuilds are both showing a small
-	# number of checksum errors.  This is particularly surprising
-	# for resilvers since the dsl scan code was for the most part
-	# unmodified.  This may be unrelated and can be investigated
-	# independantly.
-	#
-	# verify_pool $TESTPOOL
-	# log_must check_pool_status $TESTPOOL "scan" "repaired 0B"
-	# log_must check_pool_status $TESTPOOL "scan" "with 0 errors"
-	#
+	verify_pool $TESTPOOL
+	log_must check_pool_status $TESTPOOL "scan" "repaired 0B"
+	log_must check_pool_status $TESTPOOL "scan" "with 0 errors"
 
 	cleanup
 done

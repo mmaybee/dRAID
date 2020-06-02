@@ -147,16 +147,22 @@ vdev_raidz_map_free(raidz_map_t *rm)
 			abd_free(rm->rm_col[c].rc_gdata);
 	}
 
-	for (c = rm->rm_firstdatacol; c < rm->rm_cols; c++)
-		abd_put(rm->rm_col[c].rc_abd);
+	for (c = rm->rm_firstdatacol; c < rm->rm_scols; c++) {
+		abd_t *abd = rm->rm_col[c].rc_abd;
 
-	if (rm->rm_abd_skip != NULL) {
-		ASSERT(vdev_raidz_map_declustered(rm));
-		abd_free(rm->rm_abd_skip);
+		if (abd != NULL) {
+			if (abd_is_gang(abd))
+				abd_free(abd);
+			else
+				abd_put(abd);
+		}
 	}
 
 	if (rm->rm_abd_copy != NULL)
 		abd_free(rm->rm_abd_copy);
+
+	if (rm->rm_abd_skip != NULL)
+		abd_free(rm->rm_abd_skip);
 
 	kmem_free(rm, offsetof(raidz_map_t, rm_col[rm->rm_scols]));
 }
@@ -319,9 +325,12 @@ vdev_raidz_cksum_report(zio_t *zio, zio_cksum_report_t *zcr, void *arg)
 
 		abd_copy(tmp, col->rc_abd, col->rc_size);
 
-		abd_put(col->rc_abd);
-		col->rc_abd = tmp;
+		if (abd_is_gang(col->rc_abd))
+			abd_free(col->rc_abd);
+		else
+			abd_put(col->rc_abd);
 
+		col->rc_abd = tmp;
 		offset += col->rc_size;
 	}
 	ASSERT3U(offset, ==, size);
@@ -399,11 +408,11 @@ vdev_raidz_map_alloc(zio_t *zio, uint64_t ashift, uint64_t dcols,
 	rm->rm_missingparity = 0;
 	rm->rm_firstdatacol = nparity;
 	rm->rm_abd_copy = NULL;
+	rm->rm_abd_skip = NULL;
 	rm->rm_reports = 0;
 	rm->rm_freed = 0;
 	rm->rm_ecksuminjected = 0;
-	rm->rm_abd_skip = NULL;
-	rm->rm_vdev = NULL;
+	rm->rm_include_skip = 0;
 
 	asize = 0;
 
@@ -681,30 +690,23 @@ vdev_raidz_generate_parity_pqr(raidz_map_t *rm)
 void
 vdev_raidz_generate_parity(raidz_map_t *rm)
 {
-	int cols = 0;
-
-	if (vdev_raidz_map_declustered(rm) && rm->rm_firstdatacol > 1)
-		cols = vdev_draid_hide_skip_sectors(rm);
-
 	/* Generate using the new math implementation */
-	if (vdev_raidz_math_generate(rm) == RAIDZ_ORIGINAL_IMPL) {
-		switch (rm->rm_firstdatacol) {
-		case 1:
-			vdev_raidz_generate_parity_p(rm);
-			break;
-		case 2:
-			vdev_raidz_generate_parity_pq(rm);
-			break;
-		case 3:
-			vdev_raidz_generate_parity_pqr(rm);
-			break;
-		default:
-			cmn_err(CE_PANIC, "invalid RAID-Z configuration");
-		}
-	}
+	if (vdev_raidz_math_generate(rm) != RAIDZ_ORIGINAL_IMPL)
+		return;
 
-	if (cols != 0)
-		vdev_draid_restore_skip_sectors(rm, cols);
+	switch (rm->rm_firstdatacol) {
+	case 1:
+		vdev_raidz_generate_parity_p(rm);
+		break;
+	case 2:
+		vdev_raidz_generate_parity_pq(rm);
+		break;
+	case 3:
+		vdev_raidz_generate_parity_pqr(rm);
+		break;
+	default:
+		cmn_err(CE_PANIC, "invalid RAID-Z configuration");
+	}
 }
 
 /* ARGSUSED */
@@ -1369,17 +1371,23 @@ vdev_raidz_reconstruct_general(raidz_map_t *rm, int *tgts, int ntgts)
 
 	/*
 	 * Matrix reconstruction can't use scatter ABDs yet, so we allocate
-	 * temporary linear ABDs.
+	 * temporary linear ABDs if any non-linear ABDs are found.
 	 */
-	if (!abd_is_linear(rm->rm_col[rm->rm_firstdatacol].rc_abd)) {
-		bufs = kmem_alloc(rm->rm_cols * sizeof (abd_t *), KM_PUSHPAGE);
+	for (i = rm->rm_firstdatacol; i < rm->rm_cols; i++) {
+		if (!abd_is_linear(rm->rm_col[i].rc_abd)) {
+			bufs = kmem_alloc(rm->rm_cols * sizeof (abd_t *),
+			    KM_PUSHPAGE);
 
-		for (c = rm->rm_firstdatacol; c < rm->rm_cols; c++) {
-			raidz_col_t *col = &rm->rm_col[c];
+			for (c = rm->rm_firstdatacol; c < rm->rm_cols; c++) {
+				raidz_col_t *col = &rm->rm_col[c];
 
-			bufs[c] = col->rc_abd;
-			col->rc_abd = abd_alloc_linear(col->rc_size, B_TRUE);
-			abd_copy(col->rc_abd, bufs[c], col->rc_size);
+				bufs[c] = col->rc_abd;
+				col->rc_abd = abd_alloc_linear(col->rc_size,
+				    B_TRUE);
+				abd_copy(col->rc_abd, bufs[c], col->rc_size);
+			}
+
+			break;
 		}
 	}
 
@@ -1490,8 +1498,8 @@ vdev_raidz_reconstruct(raidz_map_t *rm, const int *t, int nt)
 {
 	int tgts[VDEV_RAIDZ_MAXPARITY], *dt;
 	int ntgts;
-	int i, c, code;
-	int cols = 0;
+	int i, c, ret;
+	int code;
 	int nbadparity, nbaddata;
 	int parity_valid[VDEV_RAIDZ_MAXPARITY];
 
@@ -1526,32 +1534,25 @@ vdev_raidz_reconstruct(raidz_map_t *rm, const int *t, int nt)
 	ASSERT(nbaddata >= 0);
 	ASSERT(nbaddata + nbadparity == ntgts);
 
-	if (vdev_raidz_map_declustered(rm))
-		cols = vdev_draid_hide_skip_sectors(rm);
-
 	dt = &tgts[nbadparity];
 
 	/* Reconstruct using the new math implementation */
-	code = vdev_raidz_math_reconstruct(rm, parity_valid, dt, nbaddata);
-	if (code != RAIDZ_ORIGINAL_IMPL)
-		goto out;
+	ret = vdev_raidz_math_reconstruct(rm, parity_valid, dt, nbaddata);
+	if (ret != RAIDZ_ORIGINAL_IMPL)
+		return (ret);
 
 	/*
 	 * See if we can use any of our optimized reconstruction routines.
 	 */
 	switch (nbaddata) {
 	case 1:
-		if (parity_valid[VDEV_RAIDZ_P]) {
-			code = vdev_raidz_reconstruct_p(rm, dt, 1);
-			goto out;
-		}
+		if (parity_valid[VDEV_RAIDZ_P])
+			return (vdev_raidz_reconstruct_p(rm, dt, 1));
 
 		ASSERT(rm->rm_firstdatacol > 1);
 
-		if (parity_valid[VDEV_RAIDZ_Q]) {
-			code = vdev_raidz_reconstruct_q(rm, dt, 1);
-			goto out;
-		}
+		if (parity_valid[VDEV_RAIDZ_Q])
+			return (vdev_raidz_reconstruct_q(rm, dt, 1));
 
 		ASSERT(rm->rm_firstdatacol > 2);
 		break;
@@ -1560,10 +1561,8 @@ vdev_raidz_reconstruct(raidz_map_t *rm, const int *t, int nt)
 		ASSERT(rm->rm_firstdatacol > 1);
 
 		if (parity_valid[VDEV_RAIDZ_P] &&
-		    parity_valid[VDEV_RAIDZ_Q]) {
-			code = vdev_raidz_reconstruct_pq(rm, dt, 2);
-			goto out;
-		}
+		    parity_valid[VDEV_RAIDZ_Q])
+			return (vdev_raidz_reconstruct_pq(rm, dt, 2));
 
 		ASSERT(rm->rm_firstdatacol > 2);
 
@@ -1573,9 +1572,6 @@ vdev_raidz_reconstruct(raidz_map_t *rm, const int *t, int nt)
 	code = vdev_raidz_reconstruct_general(rm, tgts, ntgts);
 	ASSERT(code < (1 << VDEV_RAIDZ_MAXPARITY));
 	ASSERT(code > 0);
-out:
-	if (cols != 0)
-		vdev_draid_restore_skip_sectors(rm, cols);
 	return (code);
 }
 
@@ -1656,6 +1652,46 @@ vdev_raidz_child_done(zio_t *zio)
 	rc->rc_error = zio->io_error;
 	rc->rc_tried = 1;
 	rc->rc_skipped = 0;
+}
+
+/*
+ * Log the raidz_map_t used for the failed I/O.  This functionality can
+ * be removed when ZFS_DEBUG_DRAID is removed.
+ */
+void
+raidz_debug_map(zio_t *zio, raidz_map_t *rm, int error)
+{
+	zfs_dbgmsg("raidz zio: off %llu sz %llu data %px error %d",
+	    zio->io_offset, zio->io_size, zio->io_abd, error);
+
+	for (int c = 0; rm != NULL && c < rm->rm_scols; c++) {
+		char t = 'D';
+		raidz_col_t *rc = &rm->rm_col[c];
+
+		if (c >= rm->rm_cols) {
+			t = 'S';
+		} else if (c < rm->rm_firstdatacol) {
+			switch (c) {
+			case 0:
+				t = 'P';
+				break;
+			case 1:
+				t = 'Q';
+				break;
+			case 2:
+				t = 'R';
+				break;
+			default:
+				ASSERT0(c);
+			}
+		}
+
+		zfs_dbgmsg("%c: dev %llu off %llu, sz %llu, "
+		    "err %d, skipped %d, tried %d abd_sz %d", t,
+		    rc->rc_devidx, rc->rc_offset, rc->rc_size,
+		    rc->rc_error, rc->rc_skipped, rc->rc_tried,
+		    abd_get_size(rc->rc_abd));
+	}
 }
 
 static void
@@ -1817,6 +1853,7 @@ raidz_checksum_error(zio_t *zio, raidz_col_t *rc, abd_t *bad_data)
 
 		mutex_enter(&vd->vdev_stat_lock);
 		vd->vdev_stat.vs_checksum_errors++;
+		raidz_debug_map(zio, rm, rc->rc_devidx);
 		mutex_exit(&vd->vdev_stat_lock);
 
 		zbc.zbc_has_cksum = 0;
@@ -1890,8 +1927,6 @@ raidz_parity_verify(zio_t *zio, raidz_map_t *rm)
 		abd_free(orig[c]);
 	}
 
-	if (ret != 0 && vdev_raidz_map_declustered(rm))
-		vdev_draid_debug_zio(zio);
 
 	return (ret);
 }
@@ -2083,7 +2118,7 @@ done:
  *   3. If there were unexpected errors or this is a resilver operation,
  *      rewrite the vdevs that had errors.
  */
-static void
+void
 vdev_raidz_io_done(zio_t *zio)
 {
 	vdev_t *vd = zio->io_vd;
@@ -2246,6 +2281,14 @@ vdev_raidz_io_done(zio_t *zio)
 	rm->rm_missingdata = 0;
 	rm->rm_missingparity = 0;
 
+	/*
+	 * If skip sectors are expected to be zero filled and this was a
+	 * normal read, then expand the raidz_map_t to include the skip
+	 * sectors so they may be read, verified, and repaired.
+	 */
+	if (rm->rm_include_skip && rm->rm_nskip > 0 && rm->rm_abd_skip == NULL)
+		vdev_draid_map_include_skip_sectors(zio);
+
 	for (c = 0; c < rm->rm_cols; c++) {
 		if (rm->rm_col[c].rc_tried)
 			continue;
@@ -2351,9 +2394,6 @@ done:
 			    ZIO_FLAG_SELF_HEAL : 0), NULL, NULL));
 		}
 	}
-
-	if (vdev_raidz_map_declustered(rm))
-		vdev_draid_fix_skip_sectors(zio);
 }
 
 static void
