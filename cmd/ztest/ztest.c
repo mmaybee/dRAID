@@ -1083,6 +1083,7 @@ make_vdev_file(char *path, char *aux, char *pool, size_t size, uint64_t ashift)
 	char *pathbuf;
 	uint64_t vdev;
 	nvlist_t *file;
+	boolean_t draid_spare = B_FALSE;
 
 	pathbuf = umem_alloc(MAXPATHLEN, UMEM_NOFAIL);
 
@@ -1104,9 +1105,11 @@ make_vdev_file(char *path, char *aux, char *pool, size_t size, uint64_t ashift)
 			    ztest_dev_template, ztest_opts.zo_dir,
 			    pool == NULL ? ztest_opts.zo_pool : pool, vdev);
 		}
+	} else {
+		draid_spare = vdev_draid_is_spare(path);
 	}
 
-	if (size != 0) {
+	if (size != 0 && !draid_spare) {
 		int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
 		if (fd == -1)
 			fatal(1, "can't open %s", path);
@@ -1115,15 +1118,11 @@ make_vdev_file(char *path, char *aux, char *pool, size_t size, uint64_t ashift)
 		(void) close(fd);
 	}
 
-	VERIFY(nvlist_alloc(&file, NV_UNIQUE_NAME, 0) == 0);
-	if (strstr(path, VDEV_TYPE_DRAID) != NULL)
-		VERIFY(nvlist_add_string(file, ZPOOL_CONFIG_TYPE,
-		    VDEV_TYPE_DRAID_SPARE) == 0);
-	else
-		VERIFY(nvlist_add_string(file, ZPOOL_CONFIG_TYPE,
-		    VDEV_TYPE_FILE) == 0);
-	VERIFY(nvlist_add_string(file, ZPOOL_CONFIG_PATH, path) == 0);
-	VERIFY(nvlist_add_uint64(file, ZPOOL_CONFIG_ASHIFT, ashift) == 0);
+	VERIFY0(nvlist_alloc(&file, NV_UNIQUE_NAME, 0));
+	VERIFY0(nvlist_add_string(file, ZPOOL_CONFIG_TYPE,
+	    draid_spare ? VDEV_TYPE_DRAID_SPARE : VDEV_TYPE_FILE));
+	VERIFY0(nvlist_add_string(file, ZPOOL_CONFIG_PATH, path));
+	VERIFY0(nvlist_add_uint64(file, ZPOOL_CONFIG_ASHIFT, ashift));
 	umem_free(pathbuf, MAXPATHLEN);
 
 	return (file);
