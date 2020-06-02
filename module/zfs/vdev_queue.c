@@ -552,6 +552,7 @@ vdev_queue_agg_io_done(zio_t *aio)
  */
 #define	IO_SPAN(fio, lio) ((lio)->io_offset + (lio)->io_size - (fio)->io_offset)
 #define	IO_GAP(fio, lio) (-IO_SPAN(lio, fio))
+#define	IO_GANG(fio) (fio->io_abd != NULL && abd_is_gang(fio->io_abd))
 
 /*
  * Sufficiently adjacent io_offset's in ZIOs will be aggregated. We do this
@@ -593,6 +594,13 @@ vdev_queue_aggregate(vdev_queue_t *vq, zio_t *zio)
 	if (zio->io_type == ZIO_TYPE_TRIM && !zfs_vdev_aggregate_trim)
 		return (NULL);
 
+	/*
+	 * I/Os which are already constructed as a gang ABD cannot be
+	 * aggregated further.
+	 */
+	if (IO_GANG(zio))
+		return (NULL);
+
 	first = last = zio;
 
 	if (zio->io_type == ZIO_TYPE_READ)
@@ -621,7 +629,8 @@ vdev_queue_aggregate(vdev_queue_t *vq, zio_t *zio)
 	    (dio->io_flags & ZIO_FLAG_AGG_INHERIT) == flags &&
 	    IO_SPAN(dio, last) <= limit &&
 	    IO_GAP(dio, first) <= maxgap &&
-	    dio->io_type == zio->io_type) {
+	    dio->io_type == zio->io_type &&
+	    !IO_GANG(dio)) {
 		first = dio;
 		if (mandatory == NULL && !(first->io_flags & ZIO_FLAG_OPTIONAL))
 			mandatory = first;
@@ -648,7 +657,8 @@ vdev_queue_aggregate(vdev_queue_t *vq, zio_t *zio)
 	    (dio->io_flags & ZIO_FLAG_OPTIONAL)) &&
 	    IO_SPAN(first, dio) <= maxblocksize &&
 	    IO_GAP(last, dio) <= maxgap &&
-	    dio->io_type == zio->io_type) {
+	    dio->io_type == zio->io_type &&
+	    !IO_GANG(dio)) {
 		last = dio;
 		if (!(last->io_flags & ZIO_FLAG_OPTIONAL))
 			mandatory = last;
