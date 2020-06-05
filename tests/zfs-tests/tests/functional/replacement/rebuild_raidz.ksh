@@ -69,7 +69,7 @@ destroy_pool $TESTPOOL1
 
 # draid
 log_must zpool create $TESTPOOL1 draid ${VDEV_FILES[@]}
-log_must zpool replace -r $TESTPOOL1 ${VDEV_FILES[1]} $SPARE_VDEV_FILE
+log_must zpool replace -s $TESTPOOL1 ${VDEV_FILES[1]} $SPARE_VDEV_FILE
 destroy_pool $TESTPOOL1
 
 log_pass "Sequential resilver is not allowed for raidz vdevs"

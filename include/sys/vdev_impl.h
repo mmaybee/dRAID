@@ -506,6 +506,9 @@ typedef struct vdev_label {
 #define	VDEV_LABEL_END_SIZE	(2 * sizeof (vdev_label_t))
 #define	VDEV_LABELS		4
 #define	VDEV_BEST_LABEL		VDEV_LABELS
+#define	VDEV_OFFSET_IS_LABEL(vd, off)                           \
+	(((off) < VDEV_LABEL_START_SIZE) ||                     \
+	((off) >= ((vd)->vdev_psize - VDEV_LABEL_END_SIZE)))
 
 #define	VDEV_ALLOC_LOAD		0
 #define	VDEV_ALLOC_ADD		1
@@ -559,31 +562,6 @@ extern vdev_ops_t vdev_missing_ops;
 extern vdev_ops_t vdev_hole_ops;
 extern vdev_ops_t vdev_spare_ops;
 extern vdev_ops_t vdev_indirect_ops;
-
-/*
- * Virtual device vector for mirroring.
- */
-typedef struct mirror_child {
-	vdev_t		*mc_vd;
-	uint64_t	mc_offset;
-	int		mc_error;
-	int		mc_load;
-	uint8_t		mc_tried;
-	uint8_t		mc_skipped;
-	uint8_t		mc_speculative;
-} mirror_child_t;
-
-typedef struct mirror_map {
-	int		*mm_preferred;
-	int		mm_preferred_cnt;
-	int		mm_children;
-	boolean_t	mm_resilvering;
-	boolean_t	mm_root;
-	mirror_child_t	mm_child[];
-} mirror_map_t;
-
-extern mirror_map_t *vdev_mirror_map_alloc(int, boolean_t, boolean_t);
-extern const zio_vsd_ops_t vdev_mirror_vsd_ops;
 
 /*
  * Common size functions

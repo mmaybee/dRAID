@@ -37,7 +37,13 @@
 #include <sys/fs/zfs.h>
 #include <sys/fm/fs/zfs.h>
 
-uint64_t vdev_draid_asize_by_type(const vdev_t *, uint64_t, uint64_t);
+
+/*
+ * dRAID is a distributed parity implementation for ZFS.
+ */
+
+static uint64_t vdev_draid_asize_by_type(const vdev_t *, uint64_t, uint64_t);
+static vdev_t *vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset);
 
 /* A child vdev is divided into slices */
 static unsigned int slice_shift = 0;
@@ -342,12 +348,18 @@ vdev_draid_map_include_skip_sectors(zio_t *zio)
 	vdev_draid_map_alloc_scrub(zio, rm);
 }
 
+/*
+ * Return the asize of a full dRAID slice across all child vdevs.
+ */
 static inline uint64_t
 vdev_draid_permutation_asize(vdev_draid_config_t *vdc)
 {
 	return ((vdc->vdc_children - vdc->vdc_spares) << DRAID_SLICESHIFT);
 }
 
+/*
+ * Converts a logical offset to the corresponding group number.
+ */
 uint64_t
 vdev_draid_offset_to_group(const vdev_t *vd, uint64_t offset)
 {
@@ -373,6 +385,9 @@ vdev_draid_offset_to_group(const vdev_t *vd, uint64_t offset)
 	return (perm * vdc->vdc_groups + group);
 }
 
+/*
+ * Converts a group number to the logical starting offset for that group.
+ */
 uint64_t
 vdev_draid_group_to_offset(const vdev_t *vd, uint64_t group)
 {
@@ -393,7 +408,7 @@ vdev_draid_group_to_offset(const vdev_t *vd, uint64_t group)
 }
 
 /*
- * Given a offset into a draid, compute a properly aligned offset.
+ * Given a starting offset compute the next properly aligned offset.
  * This involves finding the appropriate permutation chunk and then
  * computing which group in that chunk the offset falls. Once this
  * is calculated, the offset must be aligned to a slice boundry within
@@ -429,50 +444,48 @@ vdev_draid_get_astart(const vdev_t *vd, const uint64_t start)
 	return (astart);
 }
 
+/*
+ * Check if there's enough space left for the block in the group.  The passed
+ * starting offset must be properly align.  If the block fits return an
+ * updated 'asizep' and the starting offset to be used, this may be in the
+ * next group if there wasn't space in the original group.
+ */
 uint64_t
-vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *sizep)
+vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
 {
 	uint64_t group = vdev_draid_offset_to_group(vd, start);
-	uint64_t asize = vdev_draid_asize_by_type(vd, start, *sizep);
+	uint64_t asize = vdev_draid_asize_by_type(vd, start, *asizep);
 	uint64_t end = start + asize - 1;
 
-	/*
-	 * An allocation may not span metaslabs.
-	 */
+	/* An allocation may not span metaslabs. */
 	if (start >> vd->vdev_ms_shift != end >> vd->vdev_ms_shift)
 		return (-1ULL);
 
-	/*
-	 * A block is good if it:
-	 * - does not cross group boundary, AND
-	 * - does not use a remainder group
-	 */
+	/* A block is good if it does not cross a group boundary. */
 	if (group == vdev_draid_offset_to_group(vd, end)) {
 		ASSERT3U(start, ==, vdev_draid_get_astart(vd, start));
-		*sizep = asize;
+		*asizep = asize;
 		return (start);
 	}
 
-	/* jump to the next group */
+	/* Advance to the next group. */
 	group++;
 	start = vdev_draid_group_to_offset(vd, group);
-	asize = vdev_draid_asize_by_type(vd, start, *sizep);
+	asize = vdev_draid_asize_by_type(vd, start, *asizep);
 	end = start + asize - 1;
 
 	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, end));
 
-	*sizep = asize;
+	*asizep = asize;
 
 	return (start);
 }
 
-static vdev_t *vdev_dspare_get_child(vdev_t *vd, uint64_t offset);
-
 /*
- * dRAID spare does not fit into the DTL model. While it has child vdevs,
+ * A dRAID spare does not fit into the DTL model. While it has child vdevs,
  * there is no redundancy among them, and the effective child vdev is
  * determined by offset. Moreover, DTLs of a child vdev before the spare
- * becomes active are invalid, because the spare blocks were not in use yet.
+ * becomes active are invalid because the spare blocks were not in use yet.
  *
  * Here we are essentially doing a vdev_dtl_reassess() on the fly, by replacing
  * a dRAID spare with the child vdev under the offset. Note that it is a
@@ -487,8 +500,11 @@ vdev_draid_missing(vdev_t *vd, uint64_t offset, uint64_t txg, uint64_t size)
 	if (vdev_dtl_contains(vd, DTL_MISSING, txg, size))
 		return (B_TRUE);
 
-	if (vd->vdev_ops == &vdev_draid_spare_ops)
-		vd = vdev_dspare_get_child(vd, offset);
+	if (vd->vdev_ops == &vdev_draid_spare_ops) {
+		vd = vdev_draid_spare_get_child(vd, offset);
+		if (vd == NULL)
+			return (B_TRUE);
+	}
 
 	if (vd->vdev_ops != &vdev_spare_ops)
 		return (vdev_dtl_contains(vd, DTL_MISSING, txg, size));
@@ -509,49 +525,39 @@ vdev_draid_missing(vdev_t *vd, uint64_t offset, uint64_t txg, uint64_t size)
 	return (B_TRUE);
 }
 
+/*
+ * Determine if the vdev is readable at the given offset.
+ */
 boolean_t
 vdev_draid_readable(vdev_t *vd, uint64_t offset)
 {
-	int c;
-
-	if (vd->vdev_ops == &vdev_draid_spare_ops)
-		vd = vdev_dspare_get_child(vd, offset);
+	if (vd->vdev_ops == &vdev_draid_spare_ops) {
+		vd = vdev_draid_spare_get_child(vd, offset);
+		if (vd == NULL)
+			return (B_FALSE);
+	}
 
 	if (vd->vdev_ops != &vdev_spare_ops)
 		return (vdev_readable(vd));
 
-	for (c = 0; c < vd->vdev_children; c++)
+	for (int c = 0; c < vd->vdev_children; c++)
 		if (vdev_draid_readable(vd->vdev_child[c], offset))
 			return (B_TRUE);
 
 	return (B_FALSE);
 }
 
-boolean_t
-vdev_draid_is_dead(vdev_t *vd, uint64_t offset)
-{
-	int c;
-
-	if (vd->vdev_ops == &vdev_draid_spare_ops)
-		vd = vdev_dspare_get_child(vd, offset);
-
-	if (vd->vdev_ops != &vdev_spare_ops)
-		return (vdev_is_dead(vd));
-
-	for (c = 0; c < vd->vdev_children; c++)
-		if (!vdev_draid_is_dead(vd->vdev_child[c], offset))
-			return (B_FALSE);
-
-	return (B_TRUE);
-}
-
+/*
+ * Returns B_TRUE if the guid exists in the vdev tree.
+ */
 static boolean_t
 vdev_draid_guid_exists(vdev_t *vd, uint64_t guid, uint64_t offset)
 {
-	int c;
-
-	if (vd->vdev_ops == &vdev_draid_spare_ops)
-		vd = vdev_dspare_get_child(vd, offset);
+	if (vd->vdev_ops == &vdev_draid_spare_ops) {
+		vd = vdev_draid_spare_get_child(vd, offset);
+		if (vd == NULL)
+			return (B_FALSE);
+	}
 
 	if (vd->vdev_guid == guid)
 		return (B_TRUE);
@@ -559,7 +565,7 @@ vdev_draid_guid_exists(vdev_t *vd, uint64_t guid, uint64_t offset)
 	if (vd->vdev_ops->vdev_op_leaf)
 		return (B_FALSE);
 
-	for (c = 0; c < vd->vdev_children; c++)
+	for (int c = 0; c < vd->vdev_children; c++)
 		if (vdev_draid_guid_exists(vd->vdev_child[c], guid, offset))
 			return (B_TRUE);
 
@@ -580,12 +586,15 @@ vdev_draid_vd_degraded(vdev_t *vd, const vdev_t *fault_vdev, uint64_t offset)
 	return (vdev_draid_guid_exists(vd, fault_vdev->vdev_guid, offset));
 }
 
+/*
+ * Determine if the dRAID block at the logical offset and size would be
+ * degraded if the fault_vdev was unavailable.
+ */
 boolean_t
 vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
     uint64_t size)
 {
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	boolean_t degraded = B_FALSE;
 	zio_t *zio;
 	int dummy_data;
@@ -604,6 +613,7 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	raidz_map_t *rm = vdev_draid_map_alloc(zio);
 
 	uint64_t group __maybe_unused = vdev_draid_offset_to_group(vd, offset);
+	vdev_draid_config_t *vdc __maybe_unused = vd->vdev_tsd;
 	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, offset + size - 1));
 	ASSERT3U(rm->rm_scols, ==,
 	    vdc->vdc_parity + vdc->vdc_data[group % vdc->vdc_groups]);
@@ -649,8 +659,11 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	return (degraded);
 }
 
+/*
+ * Allocate memory for and copy the dRAID base permutations.
+ */
 static uint64_t *
-vdev_draid_create_base_perms(const uint8_t *perms,
+vdev_draid_create_base_permutations(const uint8_t *perms,
     const vdev_draid_config_t *vdc)
 {
 	uint64_t children = vdc->vdc_children, *base_perms;
@@ -664,6 +677,10 @@ vdev_draid_create_base_perms(const uint8_t *perms,
 	return (base_perms);
 }
 
+/*
+ * Create the vdev_draid_config_t structure from dRAID configuration stored
+ * as an nvlist in the pool configuration.
+ */
 static vdev_draid_config_t *
 vdev_draid_config_create(vdev_t *vd)
 {
@@ -672,7 +689,6 @@ vdev_draid_config_create(vdev_t *vd)
 	uint8_t *data = NULL;
 	uint64_t *ndata = NULL;
 	nvlist_t *nvl = vd->vdev_cfg;
-	ASSERT(nvl != NULL);
 
 	if (vdev_draid_config_validate(nvl, 0, vd->vdev_nparity, 0,
 	    vd->vdev_children) != DRAIDCFG_OK) {
@@ -700,11 +716,14 @@ vdev_draid_config_create(vdev_t *vd)
 	VERIFY0(nvlist_lookup_uint8_array(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_PERM, &perms, &c));
 
-	vdc->vdc_base_perms = vdev_draid_create_base_perms(perms, vdc);
+	vdc->vdc_base_perms = vdev_draid_create_base_permutations(perms, vdc);
 
 	return (vdc);
 }
 
+/*
+ * Destroy the vdev_draid_config_t structure.
+ */
 static void
 vdev_draid_config_destroy(vdev_draid_config_t *vdc)
 {
@@ -714,76 +733,38 @@ vdev_draid_config_destroy(vdev_draid_config_t *vdc)
 	kmem_free(vdc, sizeof (*vdc));
 }
 
-static int
-vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
-    uint64_t *ashift)
+/*
+ * Find the smallest child asize and largest sector size to calculate the
+ * available capacity.  Distributed spares are ignored since their capacity
+ * is also based of the minimum child size in the top-level dRAID.
+ */
+static void
+vdev_draid_calculate_asize(vdev_t *vd, uint64_t *asizep,
+    uint64_t *max_asizep, uint64_t *ashiftp)
 {
-	vdev_t *cvd;
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t nparity = vd->vdev_nparity;
-	int lasterror = 0;
-	int numerrors = 0;
+	uint64_t asize = 0, max_asize = 0, ashift = 0;
 
-	ASSERT(nparity > 0);
+	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	if (nparity > VDEV_RAIDZ_MAXPARITY || vd->vdev_children < nparity + 1) {
-		vd->vdev_stat.vs_aux = VDEV_AUX_BAD_LABEL;
-		return (SET_ERROR(EINVAL));
-	}
-
-	if (vdc == NULL) {
-		vdc = vdev_draid_config_create(vd);
-		if (vdc == NULL)
-			return (SET_ERROR(EINVAL));
-
-		vd->vdev_tsd = vdc;
-
-		/*
-		 * Used to generate dRAID spare names and calculate the min
-		 * asize even when the vdev_draid_config_t is not available
-		 * because the open fails below and the vdc is freed.
-		 */
-		vd->vdev_spares = vdc->vdc_spares;
-		vd->vdev_groups = vdc->vdc_groups;
-	} else {
-		ASSERT(vd->vdev_reopening);
-	}
-
-	/* vd->vdev_tsd must be set before vdev_open_children(vd) */
-	vdev_open_children(vd);
-
-	/* Find the size of the smallest child */
 	for (int c = 0; c < vd->vdev_children; c++) {
-		cvd = vd->vdev_child[c];
+		vdev_t *cvd = vd->vdev_child[c];
 
-		if (cvd->vdev_open_error != 0) {
-			lasterror = cvd->vdev_open_error;
-			numerrors++;
-			continue;
-		}
-
-		/* Find the smallest disk and largest sector size */
 		if (cvd->vdev_ops != &vdev_draid_spare_ops) {
-			*asize = MIN(*asize - 1, cvd->vdev_asize - 1) + 1;
-			*max_asize =
-			    MIN(*max_asize - 1, cvd->vdev_max_asize - 1) + 1;
-			*ashift = MAX(*ashift, cvd->vdev_ashift);
+			asize = MIN(asize - 1, cvd->vdev_asize - 1) + 1;
+			max_asize = MIN(max_asize - 1,
+			    cvd->vdev_max_asize - 1) + 1;
+			ashift = MAX(ashift, cvd->vdev_ashift);
 		}
 	}
 
-	*asize *= vd->vdev_children - vdc->vdc_spares;
-	*max_asize *= vd->vdev_children - vdc->vdc_spares;
-
-	if (numerrors > nparity) {
-		vd->vdev_stat.vs_aux = VDEV_AUX_NO_REPLICAS;
-		vdev_draid_config_destroy(vd->vdev_tsd);
-		vd->vdev_tsd = NULL;
-		return (lasterror);
-	}
-
-	return (0);
+	*asizep = asize;
+	*max_asizep = max_asize;
+	*ashiftp = ashift;
 }
 
+/*
+ * Close a top-level dRAID vdev.
+ */
 static void
 vdev_draid_close(vdev_t *vd)
 {
@@ -799,7 +780,84 @@ vdev_draid_close(vdev_t *vd)
 	vd->vdev_tsd = NULL;
 }
 
-uint64_t
+/*
+ * Open a top-level dRAID vdev.
+ */
+static int
+vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
+    uint64_t *ashift)
+{
+	vdev_draid_config_t *vdc;
+	uint64_t nparity = vd->vdev_nparity;
+	int open_errors = 0;
+
+	if (vd->vdev_tsd != NULL) {
+		/*
+		 * When reopening all children must be closed and opened.
+		 * The dRAID configuration itself remains valid and care
+		 * is taken to avoid destroying and recreating it.
+		 */
+		ASSERT(vd->vdev_reopening);
+		vdc = vd->vdev_tsd;
+	} else {
+		if (nparity > VDEV_RAIDZ_MAXPARITY ||
+		    vd->vdev_children < nparity + 1) {
+			vd->vdev_stat.vs_aux = VDEV_AUX_BAD_LABEL;
+			return (SET_ERROR(EINVAL));
+		}
+
+		vdc = vdev_draid_config_create(vd);
+		if (vdc == NULL)
+			return (SET_ERROR(EINVAL));
+
+		/*
+		 * Used to generate dRAID spare names and calculate the min
+		 * asize even when the vdev_draid_config_t is not available
+		 * because the open fails below and the vdc is freed.
+		 */
+		vd->vdev_spares = vdc->vdc_spares;
+		vd->vdev_groups = vdc->vdc_groups;
+		vd->vdev_tsd = vdc;
+	}
+
+	vdev_open_children(vd);
+
+	/* Verify enough of the children are avaiable to continue. */
+	for (int c = 0; c < vd->vdev_children; c++) {
+		if (vd->vdev_child[c]->vdev_open_error != 0) {
+			if ((++open_errors) > nparity) {
+				vd->vdev_stat.vs_aux = VDEV_AUX_NO_REPLICAS;
+				return (SET_ERROR(ENXIO));
+			}
+		}
+	}
+
+	vdev_draid_calculate_asize(vd, asize, max_asize, ashift);
+
+	*asize = *asize * (vd->vdev_children - vdc->vdc_spares);
+	*max_asize = *max_asize * (vd->vdev_children - vdc->vdc_spares);
+
+	/*
+	 * Active distributed spares must be closed and reopened to calculate
+	 * the correct psize in the event that the dRAID vdevs were expanded.
+	 */
+	spa_aux_vdev_t *sav = &vd->vdev_spa->spa_spares;
+
+	for (int i = 0; i < sav->sav_count; i++) {
+		vdev_t *svd = sav->sav_vdevs[i];
+
+		if ((vd->vdev_ops == &vdev_draid_spare_ops) &&
+		    (vdev_draid_spare_get_parent(svd) == vd) &&
+		    (vdev_draid_spare_is_active(svd))) {
+			vdev_close(svd);
+			vdev_open(svd);
+		}
+	}
+
+	return (0);
+}
+
+static uint64_t
 vdev_draid_asize_by_type(const vdev_t *vd, uint64_t offset, uint64_t psize)
 {
 	uint64_t group;
@@ -826,6 +884,12 @@ vdev_draid_asize_by_type(const vdev_t *vd, uint64_t offset, uint64_t psize)
 	return (asize << ashift);
 }
 
+/*
+ * Calculate the inflated asize for the specified offset and psize.  It's
+ * possible to pass -1 for the offset when it's unknown by the caller.  In
+ * this case we can't compute a precise asize, but we can return an over-
+ * estimated value for the size and correct it later at allocation.
+ */
 static uint64_t
 vdev_draid_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
 {
@@ -838,29 +902,28 @@ vdev_draid_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
 
 	if (offset != -1)
 		return (vdev_draid_asize_by_type(vd, offset, psize));
-	/*
-	 * We can't compute precise asize unless we know the offset.
-	 * Over-estimate the size and correct later at allocation.
-	 */
 
-	/* compute asize using first group size */
+	/* Compute asize using first group size */
 	asizef = roundup(asizef, ndata);
 	asizef += nparity * (asizef / ndata);
 	ASSERT0(asizef % (nparity + ndata));
 
-	/* compute asize using last group size */
+	/* Compute asize using last group size */
 	ndata = vdc->vdc_data[last];
 	asizel = roundup(asizel, ndata);
 	asizel += nparity * (asizel / ndata);
 	ASSERT0(asizel % (nparity + ndata));
 
-	/* return larger of the two sizes computed */
+	/* Return larger of the two sizes computed */
 	if (asizef > asizel)
 		return (asizef << vd->vdev_top->vdev_ashift);
 	else
 		return (asizel << vd->vdev_top->vdev_ashift);
 }
 
+/*
+ * Deflate the asize to the psize for a block at the provided offset.
+ */
 uint64_t
 vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
 {
@@ -883,6 +946,9 @@ vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
 	return (psize);
 }
 
+/*
+ * Return the asize of the largest block which can be reconstructed.
+ */
 uint64_t
 vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 {
@@ -905,10 +971,13 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 	return (vdev_draid_asize_by_type(vd, offset, maxpsize));
 }
 
+/*
+ * Returns B_TRUE if the block at the offset and size is degraded and
+ * needs to be resilvered.
+ */
 static boolean_t
 vdev_draid_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
 {
-	/* A block cannot cross redundancy group boundary */
 	ASSERT3U(vdev_draid_offset_to_group(vd, offset), ==,
 	    vdev_draid_offset_to_group(vd, offset + psize - 1));
 
@@ -916,7 +985,7 @@ vdev_draid_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
 }
 
 /*
- * Start an IO operation on a dRAID VDev
+ * Start an IO operation on a dRAID vdev
  *
  * Outline:
  * - For write operations:
@@ -1013,6 +1082,10 @@ vdev_draid_io_start(zio_t *zio)
 	zio_execute(zio);
 }
 
+/*
+ * Complete an IO operation on a dRAID vdev.  The raidz logic can be applied
+ * to dRAID since the layout is fully described by the raidz_map_t.
+ */
 static void
 vdev_draid_io_done(zio_t *zio)
 {
@@ -1022,13 +1095,7 @@ vdev_draid_io_done(zio_t *zio)
 static void
 vdev_draid_state_change(vdev_t *vd, int faulted, int degraded)
 {
-	if (faulted > vd->vdev_nparity)
-		vdev_set_state(vd, B_FALSE, VDEV_STATE_CANT_OPEN,
-		    VDEV_AUX_NO_REPLICAS);
-	else if (degraded + faulted != 0)
-		vdev_set_state(vd, B_FALSE, VDEV_STATE_DEGRADED, VDEV_AUX_NONE);
-	else
-		vdev_set_state(vd, B_FALSE, VDEV_STATE_HEALTHY, VDEV_AUX_NONE);
+	vdev_raidz_state_change(vd, faulted, degraded);
 }
 
 /*
@@ -1118,30 +1185,88 @@ vdev_ops_t vdev_draid_ops = {
 	.vdev_op_rele = NULL,
 	.vdev_op_remap = NULL,
 	.vdev_op_xlate = vdev_draid_xlate,
-	.vdev_op_type = VDEV_TYPE_DRAID,	/* name of this vdev type */
-	.vdev_op_leaf = B_FALSE,		/* not a leaf vdev */
+	.vdev_op_type = VDEV_TYPE_DRAID,
+	.vdev_op_leaf = B_FALSE,
 };
 
+
+/*
+ * A dRAID distributed spare is a virtual leaf vdev which is included in the
+ * parent dRAID configuration.  The last N columns of the dRAID permutation
+ * table are used to determine on which dRAID children a specific offset
+ * should be written.  These spare leaf vdevs can only be used to replace
+ * faulted children in the same dRAID configuration.
+ */
+
+/*
+ * Distributed spare state.  All fields are set when distributed spare is
+ * frst opened and are immutable.
+ */
 typedef struct {
-	vdev_t	*vds_draid_vdev;
-	uint64_t vds_spare_id;
+	vdev_t *vds_draid_vdev;		/* top-level parent dRAID vdev */
+	uint64_t vds_spare_id;		/* spare id (0 - vdc->vdc_spares-1) */
 } vdev_draid_spare_t;
 
-static vdev_t *
-vdev_dspare_get_child(vdev_t *vd, uint64_t offset)
+/*
+ * Returns the parent dRAID vdev to which the distributed spare belongs.
+ * This may be safely called even when the vdev is not open.
+ */
+vdev_t *
+vdev_draid_spare_get_parent(vdev_t *vd)
 {
-	vdev_draid_spare_t *vds = vd->vdev_tsd;
-	vdev_draid_config_t *vdc;
-	uint64_t spare_id;
-	vdev_t *tvd;
+	uint64_t parity, groups, spares, vdev_id, spare_id;
+	vdev_t *rvd = vd->vdev_spa->spa_root_vdev;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
-	ASSERT3U(offset, <, vd->vdev_psize -
-	    (VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE));
-	ASSERT(vds != NULL);
+	if (vdev_draid_spare_values(vd->vdev_path, &parity, &groups,
+	    &spares, &vdev_id, &spare_id) != 0) {
+		return (NULL);
+	}
 
-	tvd = vds->vds_draid_vdev;
-	vdc = tvd->vdev_tsd;
+	if (vdev_id >= rvd->vdev_children)
+		return (NULL);
+
+	return (rvd->vdev_child[vdev_id]);
+}
+
+/*
+ * A dRAID space is active when it's the child of a vdev using the
+ * vdev_spare_ops, vdev_replacing_ops or vdev_draid_ops.
+ */
+boolean_t
+vdev_draid_spare_is_active(vdev_t *vd)
+{
+	vdev_t *pvd = vd->vdev_parent;
+
+	if (pvd != NULL && (pvd->vdev_ops == &vdev_spare_ops ||
+	    pvd->vdev_ops == &vdev_replacing_ops ||
+	    pvd->vdev_ops == &vdev_draid_ops)) {
+		return (B_TRUE);
+	} else {
+		return (B_FALSE);
+	}
+}
+
+/*
+ * Expects a dRAID distribute spare vdev and returns the child vdev on which
+ * the provied offset resides.
+ */
+static vdev_t *
+vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
+{
+	vdev_draid_spare_t *vds = vd->vdev_tsd;
+	uint64_t spare_id;
+
+	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
+
+	/* The vdev is closed or an invalid offset was provided. */
+	if (vds == NULL || offset >= vd->vdev_psize -
+	    (VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE)) {
+		return (NULL);
+	}
+
+	vdev_t *tvd = vds->vds_draid_vdev;
+	vdev_draid_config_t *vdc = tvd->vdev_tsd;
 
 	ASSERT3P(tvd->vdev_ops, ==, &vdev_draid_ops);
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
@@ -1152,79 +1277,36 @@ vdev_dspare_get_child(vdev_t *vd, uint64_t offset)
 	return (tvd->vdev_child[spare_id]);
 }
 
-vdev_t *
-vdev_draid_spare_get_parent(vdev_t *vd)
+/*
+ * Close a dRAID spare device.
+ */
+static void
+vdev_draid_spare_close(vdev_t *vd)
 {
 	vdev_draid_spare_t *vds = vd->vdev_tsd;
 
-	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
-	ASSERT(vds != NULL);
-	ASSERT(vds->vds_draid_vdev != NULL);
+	if (vd->vdev_reopening || vds == NULL)
+		return;
 
-	return (vds->vds_draid_vdev);
-}
-
-/*
- * Generates a valid label for the dRAID distributed spare in order
- * for it to convincingly simulate a physical leaf vdev.
- */
-nvlist_t *
-vdev_draid_spare_read_config(vdev_t *vd)
-{
-	spa_t *spa = vd->vdev_spa;
-	spa_aux_vdev_t *sav = &spa->spa_spares;
-	nvlist_t *nv = fnvlist_alloc();
-
-	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
-
-	fnvlist_add_uint64(nv, ZPOOL_CONFIG_IS_SPARE, 1);
-	fnvlist_add_uint64(nv, ZPOOL_CONFIG_CREATE_TXG, vd->vdev_crtxg);
-	fnvlist_add_uint64(nv, ZPOOL_CONFIG_VERSION, spa_version(spa));
-	fnvlist_add_string(nv, ZPOOL_CONFIG_POOL_NAME, spa_name(spa));
-	fnvlist_add_uint64(nv, ZPOOL_CONFIG_POOL_GUID, spa_guid(spa));
-	fnvlist_add_uint64(nv, ZPOOL_CONFIG_POOL_TXG, spa->spa_config_txg);
-	fnvlist_add_uint64(nv, ZPOOL_CONFIG_TOP_GUID, vd->vdev_top->vdev_guid);
-
-	/*
-	 * We are in use if our parent is spare_ops
-	 */
-	if (vd->vdev_parent != NULL &&
-	    vd->vdev_parent->vdev_ops == &vdev_spare_ops) {
-		fnvlist_add_uint64(nv,
-		    ZPOOL_CONFIG_POOL_STATE, POOL_STATE_ACTIVE);
-	} else {
-		fnvlist_add_uint64(nv,
-		    ZPOOL_CONFIG_POOL_STATE, POOL_STATE_SPARE);
-	}
-
-	uint64_t guid = vd->vdev_guid;
-	for (int i = 0; i < sav->sav_count; i++) {
-		if (sav->sav_vdevs[i]->vdev_ops == &vdev_draid_spare_ops &&
-		    strcmp(sav->sav_vdevs[i]->vdev_path, vd->vdev_path) == 0) {
-			guid = sav->sav_vdevs[i]->vdev_guid;
-			break;
-		}
-	}
-	fnvlist_add_uint64(nv, ZPOOL_CONFIG_GUID, guid);
-
-	return (nv);
+	vd->vdev_tsd = NULL;
+	kmem_free(vds, sizeof (vdev_draid_spare_t));
 }
 
 /*
  * Opening a dRAID spare device is done by extracting the top-level vdev id
- * and dRAID spare number from the provided vd->vdev_path identified.  Any
- * additional information encoded in the identifier is solely used to
+ * and dRAID spare number from the provided vd->vdev_path identifier.  Any
+ * additional information encoded in the identifier is solely used for
  * verification cross-checks and is not strictly required.
  */
 static int
-vdev_dspare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
+vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
     uint64_t *ashift)
 {
 	uint64_t parity, groups, spares, vdev_id, spare_id;
 	uint64_t asize, max_asize;
 	vdev_draid_config_t *vdc;
 	vdev_draid_spare_t *vds;
-	vdev_t *tvd, *rvd;
+	vdev_t *tvd, *rvd = vd->vdev_spa->spa_root_vdev;
 	int error;
 
 	if (vd->vdev_tsd != NULL) {
@@ -1241,10 +1323,9 @@ vdev_dspare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	if (error)
 		return (error);
 
-	if (vdev_id >= vd->vdev_spa->spa_root_vdev->vdev_children)
+	if (vdev_id >= rvd->vdev_children)
 		return (SET_ERROR(EINVAL));
 
-	rvd = vd->vdev_spa->spa_root_vdev;
 	tvd = rvd->vdev_child[vdev_id];
 	vdc = tvd->vdev_tsd;
 
@@ -1252,7 +1333,7 @@ vdev_dspare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	if (tvd->vdev_ops != &vdev_draid_ops || vdc == NULL)
 		return (SET_ERROR(EINVAL));
 
-	/* Spare name dDRAID settings agree with top-level dRAID vdev */
+	/* Spare name dRAID settings agree with top-level dRAID vdev */
 	if (vdc->vdc_parity != parity || vdc->vdc_groups != groups ||
 	    vdc->vdc_spares != spares || vdc->vdc_spares <= spare_id) {
 		return (SET_ERROR(EINVAL));
@@ -1264,144 +1345,242 @@ vdev_dspare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	vd->vdev_tsd = vds;
 
 skip_open:
-	asize = tvd->vdev_asize / (tvd->vdev_children - spares);
+	/*
+	 * Neither tvd->vdev_asize or tvd->vdev_max_asize can be used here
+	 * because the caller may be vdev_draid_open() in which case the
+	 * values are stale as they haven't yet been updated by vdev_open().
+	 * To avoid this always recalculate the dRAIDs asize and max_asize.
+	 */
+	vdev_draid_calculate_asize(tvd, &asize, &max_asize, ashift);
 
-	/* If parent max_asize not yet set, use asize */
-	if (tvd->vdev_max_asize == 0) {
-		max_asize = asize;
-	} else {
-		max_asize = tvd->vdev_max_asize /
-		    (tvd->vdev_children - vdc->vdc_spares);
-	}
-
-	*ashift = tvd->vdev_ashift;
 	*psize = asize + VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE;
 	*max_psize = max_asize + VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE;
 
 	return (0);
 }
 
+/*
+ * Completed distributed spare IO.  Store the result in the parent zio
+ * as if it had peformed the operation itself.  Only the first error is
+ * preserved if there are multiple errors.
+ */
 static void
-vdev_dspare_close(vdev_t *vd)
-{
-	vdev_draid_spare_t *vds = vd->vdev_tsd;
-
-	if (vd->vdev_reopening || vds == NULL)
-		return;
-
-	vd->vdev_tsd = NULL;
-	kmem_free(vds, sizeof (vdev_draid_spare_t));
-}
-
-static uint64_t
-vdev_dspare_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
-{
-	/* HH: this function should never get called */
-	ASSERT0(offset);
-	ASSERT0(psize);
-	return (0);
-}
-
-static void
-vdev_dspare_child_done(zio_t *zio)
+vdev_draid_spare_child_done(zio_t *zio)
 {
 	zio_t *pio = zio->io_private;
 
-	pio->io_error = zio->io_error;
-}
-
-static void
-vdev_dspare_io_start(zio_t *zio)
-{
-	vdev_t *vd = zio->io_vd;
-	vdev_t *cvd;
-	uint64_t offset = zio->io_offset;
-
-	/* HH: if dspare gets a FLUSH, so do all children of the draid vdev */
-	if (zio->io_type == ZIO_TYPE_IOCTL) {
-		zio->io_error = 0;
-		zio_execute(zio);
-		return;
-	}
-
-	/*
-	 * HH: at pool creation, dspare gets some writes with
-	 * ZIO_FLAG_SPECULATIVE and ZIO_FLAG_NODATA.
-	 * Need to understand and handle them right.
-	 * Leave as-is until I can investigate.
-	 */
-	if (zio->io_flags & ZIO_FLAG_NODATA) {
-		zio->io_error = 0;
-		zio_execute(zio);
-		return;
-	}
-
-	if (offset < VDEV_LABEL_START_SIZE ||
-	    offset >= vd->vdev_psize - VDEV_LABEL_END_SIZE) {
-		/*
-		 * HH: dspare should not get any label IO as it is pretending
-		 * to be a leaf disk. Later should catch and fix all places
-		 * that still does label IO to dspare.
-		 *
-		 * ASSERT(zio->io_flags & ZIO_FLAG_PHYSICAL);
-		 */
-		zio->io_error = SET_ERROR(EIO);
-		zio_interrupt(zio);
-		return;
-	}
-
-	offset -= VDEV_LABEL_START_SIZE; /* See zio_vdev_child_io() */
-	cvd = vdev_dspare_get_child(vd, offset);
-	if (zio->io_type == ZIO_TYPE_READ && !vdev_readable(cvd)) {
-		zio->io_error = SET_ERROR(ENXIO);
-		zio_interrupt(zio);
-		/*
-		 * Parent vdev should have avoided reading from me in the first
-		 * place, unless this is a mirror scrub.
-		 */
-		zfs_dbgmsg("read from dead spare %s:%s:%s at %llu",
-		    vd->vdev_path, cvd->vdev_ops->vdev_op_type,
-		    cvd->vdev_path != NULL ? cvd->vdev_path : "NA", offset);
-		return;
-	}
-
-	/* dspare IO does not cross slice boundary */
-	ASSERT3U(offset >> DRAID_SLICESHIFT, ==,
-	    (offset + zio->io_size - 1) >> DRAID_SLICESHIFT);
-
-	zio_nowait(zio_vdev_child_io(zio, NULL, cvd, offset, zio->io_abd,
-	    zio->io_size, zio->io_type, zio->io_priority, 0,
-	    vdev_dspare_child_done, zio));
-	zio_execute(zio);
-}
-
-static void
-vdev_dspare_io_done(zio_t *zio)
-{
+	if (pio->io_error == 0)
+		pio->io_error = zio->io_error;
 }
 
 /*
- * Initializing and trimming of distributed spares is currently disabled.
+ * Returns a valid label config for the distributed spare vdev.  This is
+ * used to bypass the IO pipeline to avoid the complexity of constructing
+ * a complete label with valid checksum to return when read.
+ */
+nvlist_t *
+vdev_draid_read_config_spare(vdev_t *vd)
+{
+	spa_t *spa = vd->vdev_spa;
+	spa_aux_vdev_t *sav = &spa->spa_spares;
+	uint64_t guid = vd->vdev_guid;
+
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_IS_SPARE, 1);
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_CREATE_TXG, vd->vdev_crtxg);
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_VERSION, spa_version(spa));
+	fnvlist_add_string(nv, ZPOOL_CONFIG_POOL_NAME, spa_name(spa));
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_POOL_GUID, spa_guid(spa));
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_POOL_TXG, spa->spa_config_txg);
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_TOP_GUID, vd->vdev_top->vdev_guid);
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_POOL_STATE,
+	    vdev_draid_spare_is_active(vd) ?
+	    POOL_STATE_ACTIVE : POOL_STATE_SPARE);
+
+	/* Set the vdev guid based on the vdev list in sav_count. */
+	for (int i = 0; i < sav->sav_count; i++) {
+		if (sav->sav_vdevs[i]->vdev_ops == &vdev_draid_spare_ops &&
+		    strcmp(sav->sav_vdevs[i]->vdev_path, vd->vdev_path) == 0) {
+			guid = sav->sav_vdevs[i]->vdev_guid;
+			break;
+		}
+	}
+
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_GUID, guid);
+
+	return (nv);
+}
+
+/*
+ * Handle any ioctl requested of the distributed spare.  Only flushes
+ * are supported in which case all children must be flushed.
+ */
+static int
+vdev_draid_spare_ioctl(zio_t *zio)
+{
+	vdev_t *vd = zio->io_vd;
+	int error = 0;
+
+	if (zio->io_cmd == DKIOCFLUSHWRITECACHE) {
+		for (int c = 0; c < vd->vdev_children; c++) {
+			zio_nowait(zio_vdev_child_io(zio, NULL,
+			    vd->vdev_child[c], zio->io_offset, zio->io_abd,
+			    zio->io_size, zio->io_type, zio->io_priority, 0,
+			    vdev_draid_spare_child_done, zio));
+		}
+	} else {
+		error = SET_ERROR(ENOTSUP);
+	}
+
+	return (error);
+}
+
+/*
+ * Initiate an IO to the distributed spare.  For normal IOs this entails using
+ * the zio->io_offset and permutation table to calculate which child dRAID vdev
+ * is responsible for the data.  Then passing along the zio to that child to
+ * perform the actual IO.  The label ranges are not stored on disk and require
+ * some special handling which is described below.
  */
 static void
-vdev_dspare_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
+vdev_draid_spare_io_start(zio_t *zio)
 {
-	res->rs_start = in->rs_start;
-	res->rs_end = in->rs_start;
+	vdev_t *cvd = NULL, *vd = zio->io_vd;
+	vdev_draid_spare_t *vds = vd->vdev_tsd;
+	uint64_t offset = zio->io_offset - VDEV_LABEL_START_SIZE;
+
+	/*
+	 * If the vdev is closed, it's likely in the REMOVED or FAULTED state.
+	 * Nothing to be done here but return failure.
+	 */
+	if (vds == NULL) {
+		zio->io_error = ENXIO;
+		zio_interrupt(zio);
+		return;
+	}
+
+	/* Distributed spare IO never crosses a slice boundary. */
+	IMPLY(zio->io_type != ZIO_TYPE_IOCTL, offset >> DRAID_SLICESHIFT ==
+	    (offset + zio->io_size - 1) >> DRAID_SLICESHIFT);
+
+	switch (zio->io_type) {
+	case ZIO_TYPE_IOCTL:
+		zio->io_error = vdev_draid_spare_ioctl(zio);
+		zio_execute(zio);
+		return;
+
+	case ZIO_TYPE_WRITE:
+		if (VDEV_OFFSET_IS_LABEL(vd, zio->io_offset)) {
+			/*
+			 * Accept probe IOs and config writers to simulate the
+			 * existence of an on disk label.  vdev_label_sync(),
+			 * vdev_uberblock_sync() and vdev_copy_uberblocks()
+			 * skip the distributed spares.  This only leaves
+			 * vdev_label_init() which is allowed to succeed to
+			 * avoid adding special cases the function.
+			 */
+			if (zio->io_flags & ZIO_FLAG_PROBE ||
+			    zio->io_flags & ZIO_FLAG_CONFIG_WRITER) {
+				zio->io_error = 0;
+			} else {
+				zio->io_error = SET_ERROR(EIO);
+			}
+
+			zio_interrupt(zio);
+		} else {
+			cvd = vdev_draid_spare_get_child(vd, offset);
+
+			if (cvd == NULL || !vdev_writeable(cvd)) {
+				zio->io_error = SET_ERROR(ENXIO);
+				zio_interrupt(zio);
+			} else {
+				zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
+				    offset, zio->io_abd, zio->io_size,
+				    zio->io_type, zio->io_priority, 0,
+				    vdev_draid_spare_child_done, zio));
+				zio_execute(zio);
+			}
+		}
+
+		return;
+
+	case ZIO_TYPE_READ:
+		if (VDEV_OFFSET_IS_LABEL(vd, zio->io_offset)) {
+			/*
+			 * Accept probe IOs to simulate the existence of a
+			 * label.  vdev_label_read_config() bypasses the
+			 * pipeline to read the label configuration and
+			 * vdev_uberblock_load() skips distributed spares
+			 * when attempting to locate the best uberblock.
+			 */
+			if (zio->io_flags & ZIO_FLAG_PROBE) {
+				zio->io_error = 0;
+			} else {
+				zio->io_error = SET_ERROR(EIO);
+			}
+
+			zio_interrupt(zio);
+		} else {
+			cvd = vdev_draid_spare_get_child(vd, offset);
+
+			if (cvd == NULL || !vdev_readable(cvd)) {
+				zio->io_error = SET_ERROR(ENXIO);
+				zio_interrupt(zio);
+			} else {
+				zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
+				    offset, zio->io_abd, zio->io_size,
+				    zio->io_type, zio->io_priority, 0,
+				    vdev_draid_spare_child_done, zio));
+				zio_execute(zio);
+			}
+		}
+
+		return;
+
+	case ZIO_TYPE_TRIM:
+		/* The vdev label ranges are never trimmed */
+		ASSERT0(VDEV_OFFSET_IS_LABEL(vd, zio->io_offset));
+
+		cvd = vdev_draid_spare_get_child(vd, offset);
+
+		if (cvd == NULL || !cvd->vdev_has_trim) {
+			zio->io_error = SET_ERROR(ENXIO);
+			zio_interrupt(zio);
+		} else {
+			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
+			    offset, zio->io_abd, zio->io_size,
+			    zio->io_type, zio->io_priority, 0,
+			    vdev_draid_spare_child_done, zio));
+			zio_execute(zio);
+		}
+
+		return;
+
+	default:
+		zio->io_error = SET_ERROR(ENOTSUP);
+		zio_interrupt(zio);
+		return;
+	}
+}
+
+/* ARGSUSED */
+static void
+vdev_draid_spare_io_done(zio_t *zio)
+{
 }
 
 vdev_ops_t vdev_draid_spare_ops = {
-	.vdev_op_open = vdev_dspare_open,
-	.vdev_op_close = vdev_dspare_close,
-	.vdev_op_asize = vdev_dspare_asize,
-	.vdev_op_io_start = vdev_dspare_io_start,
-	.vdev_op_io_done = vdev_dspare_io_done,
+	.vdev_op_open = vdev_draid_spare_open,
+	.vdev_op_close = vdev_draid_spare_close,
+	.vdev_op_asize = vdev_default_asize,
+	.vdev_op_io_start = vdev_draid_spare_io_start,
+	.vdev_op_io_done = vdev_draid_spare_io_done,
 	.vdev_op_state_change = NULL,
 	.vdev_op_need_resilver = NULL,
 	.vdev_op_hold = NULL,
 	.vdev_op_rele = NULL,
 	.vdev_op_remap = NULL,
-	.vdev_op_xlate = vdev_dspare_xlate,
+	.vdev_op_xlate = vdev_default_xlate,
 	.vdev_op_type = VDEV_TYPE_DRAID_SPARE,
 	.vdev_op_leaf = B_TRUE,
 };
