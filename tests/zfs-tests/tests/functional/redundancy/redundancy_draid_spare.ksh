@@ -25,10 +25,10 @@
 
 #
 # DESCRIPTION:
-# Verify resilver and rebuild to dRAID distributed spares.
+# Verify resilver to dRAID distributed spares.
 #
 # STRATEGY:
-# 1. For resilvers and rebuilds:
+# 1. For resilvers:
 #    a. Create a semi-random dRAID pool configuration which can:
 #       - sustain N failures (1-3), and
 #       - has N distributed spares to replace all faulted vdevs
@@ -38,16 +38,16 @@
 #    e. Verify the contents of files in the pool
 #
 
-log_assert "Verify resilver and rebuild to dRAID distributed spares"
+log_assert "Verify resilver to dRAID distributed spares"
 
 log_onexit cleanup
 
-for replace_mode in "resilver" "rebuild"; do
+for replace_mode in "healing" "sequential"; do
 
-	if [[ "$replace_mode" = "resilver" ]]; then
-		flags=""
+	if [[ "$replace_mode" = "sequential" ]]; then
+		flags="-s"
 	else
-		flags="-r"
+		flags=""
 	fi
 
 	parity=$(random_int_between 1 3)
@@ -70,12 +70,12 @@ for replace_mode in "resilver" "rebuild"; do
 	i=0
 	while [[ $i -lt $spares ]]; do
 		fault_vdev="$BASEDIR/vdev$i"
-		spare_vdev="$BASEDIR/spare$i"
-		#spare_vdev="s${i}-${draid}-0"
+		#spare_vdev="$BASEDIR/spare$i"
+		spare_vdev="s${i}-${draid}-0"
 		log_must zpool offline -f $TESTPOOL $fault_vdev
 		log_must zpool replace -w $flags $TESTPOOL \
 		    $fault_vdev $spare_vdev
-		#log_must zpool detach $TESTPOOL $fault_vdev
+		log_must zpool detach $TESTPOOL $fault_vdev
 		(( i += 1 ))
 	done
 
@@ -88,4 +88,4 @@ for replace_mode in "resilver" "rebuild"; do
 	cleanup
 done
 
-log_pass "Verify resilver and rebuild to dRAID distributed spares"
+log_pass "Verify resilver to dRAID distributed spares"
