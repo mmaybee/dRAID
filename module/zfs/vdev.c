@@ -1088,7 +1088,6 @@ vdev_top_transfer(vdev_t *svd, vdev_t *tvd)
 	int t;
 
 	ASSERT(tvd == tvd->vdev_top);
-	ASSERT(svd->vdev_ops != &vdev_draid_ops);
 
 	tvd->vdev_pending_fastwrite = svd->vdev_pending_fastwrite;
 	tvd->vdev_ms_array = svd->vdev_ms_array;
@@ -1548,9 +1547,6 @@ vdev_probe(vdev_t *vd, zio_t *zio)
 
 	ASSERT(vd->vdev_ops->vdev_op_leaf);
 
-	if (vd->vdev_ops == &vdev_draid_spare_ops)
-		return (NULL);
-
 	/*
 	 * Don't probe the probe.
 	 */
@@ -1658,39 +1654,37 @@ vdev_uses_zvols(vdev_t *vd)
 	return (B_FALSE);
 }
 
+/*
+ * Opens all of the vdev's children.  If any of the leaf vdevs are using
+ * a ZFS volume then do the opens in a single thread.  This avoids a
+ * deadlock when the current thread is holding the spa_namespace_lock.
+ */
 void
 vdev_open_children(vdev_t *vd)
 {
-	taskq_t *tq;
 	int children = vd->vdev_children;
 
-	/*
-	 * in order to handle pools on top of zvols, do the opens
-	 * in a single thread so that the same thread holds the
-	 * spa_namespace_lock
-	 */
-	if (vdev_uses_zvols(vd)) {
-retry_sync:
-		for (int c = 0; c < children; c++)
-			vd->vdev_child[c]->vdev_open_error =
-			    vdev_open(vd->vdev_child[c]);
-	} else {
-		tq = taskq_create("vdev_open", children, minclsyspri,
-		    children, children, TASKQ_PREPOPULATE);
-		if (tq == NULL)
-			goto retry_sync;
-
-		for (int c = 0; c < children; c++)
-			VERIFY(taskq_dispatch(tq, vdev_open_child,
-			    vd->vdev_child[c], TQ_SLEEP) != TASKQID_INVALID);
-
-		taskq_destroy(tq);
-	}
-
+	taskq_t *tq = taskq_create("vdev_open", children, minclsyspri,
+	    children, children, TASKQ_PREPOPULATE);
 	vd->vdev_nonrot = B_TRUE;
 
-	for (int c = 0; c < children; c++)
-		vd->vdev_nonrot &= vd->vdev_child[c]->vdev_nonrot;
+	for (int c = 0; c < children; c++) {
+		vdev_t *cvd = vd->vdev_child[c];
+
+		if (tq == NULL || vdev_uses_zvols(vd)) {
+			cvd->vdev_open_error = vdev_open(cvd);
+		} else {
+			VERIFY(taskq_dispatch(tq, vdev_open_child,
+			    cvd, TQ_SLEEP) != TASKQID_INVALID);
+		}
+
+		vd->vdev_nonrot &= cvd->vdev_nonrot;
+	}
+
+	if (tq != NULL) {
+		taskq_wait(tq);
+		taskq_destroy(tq);
+	}
 }
 
 /*
@@ -1921,7 +1915,6 @@ vdev_open(vdev_t *vd)
 	 * vdev open for business.
 	 */
 	if (vd->vdev_ops->vdev_op_leaf &&
-	    vd->vdev_ops != &vdev_draid_spare_ops &&
 	    (error = zio_wait(vdev_probe(vd, NULL))) != 0) {
 		vdev_set_state(vd, B_TRUE, VDEV_STATE_FAULTED,
 		    VDEV_AUX_ERR_EXCEEDED);
@@ -2266,7 +2259,8 @@ vdev_close(vdev_t *vd)
 	vdev_t *pvd = vd->vdev_parent;
 	spa_t *spa __maybe_unused = vd->vdev_spa;
 
-	ASSERT(spa_config_held(spa, SCL_STATE_ALL, RW_WRITER) == SCL_STATE_ALL);
+	ASSERT(vd->vdev_open_thread == curthread ||
+	    spa_config_held(spa, SCL_STATE_ALL, RW_WRITER) == SCL_STATE_ALL);
 
 	/*
 	 * If our parent is reopening, then we are as well, unless we are
@@ -4343,7 +4337,6 @@ vdev_stat_update(zio_t *zio, uint64_t psize)
 
 	if (spa->spa_load_state == SPA_LOAD_NONE &&
 	    type == ZIO_TYPE_WRITE && txg != 0 &&
-	    vd->vdev_ops != &vdev_draid_spare_ops &&
 	    (!(flags & ZIO_FLAG_IO_REPAIR) ||
 	    (flags & ZIO_FLAG_SCAN_THREAD) ||
 	    spa->spa_claiming)) {

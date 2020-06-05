@@ -1293,7 +1293,6 @@ vdev_draid_config_write_file(const char *path, char *key, nvlist_t *cfg)
 {
 	char tmppath[] = "/tmp/draid.cfg.XXXXXX";
 	nvlist_t *allcfgs;
-	size_t len = 0;
 	int error, fd;
 
 	error = vdev_draid_config_read_file_impl(path, &allcfgs);
@@ -1306,11 +1305,22 @@ vdev_draid_config_write_file(const char *path, char *key, nvlist_t *cfg)
 		return (error);
 	}
 
-	void *packed = fnvlist_pack_xdr(allcfgs, &len);
-	nvlist_free(allcfgs);
+	size_t buflen = 0;
+	error = nvlist_size(allcfgs, &buflen, NV_ENCODE_XDR);
+	if (error) {
+		nvlist_free(allcfgs);
+		return (error);
+	}
 
-	if (packed == NULL)
-		return (ENOMEM);
+	char *buf = kmem_zalloc(buflen, KM_SLEEP);
+	error = nvlist_pack(allcfgs, &buf, &buflen, NV_ENCODE_XDR, KM_SLEEP);
+	if (error) {
+		kmem_free(buf, buflen);
+		nvlist_free(allcfgs);
+		return (error);
+	}
+
+	nvlist_free(allcfgs);
 
 	/*
 	 * Atomically update the file using a temporary file and the
@@ -1319,16 +1329,18 @@ vdev_draid_config_write_file(const char *path, char *key, nvlist_t *cfg)
 	 * is updated atomically and is internally consistent.
 	 */
 	fd = mkstemp(tmppath);
-	if (fd < 0)
+	if (fd < 0) {
+		kmem_free(buf, buflen);
 		return (errno);
+	}
 
 	ssize_t rc, bytes = 0;
-	while (bytes < len) {
-		size_t size = MIN(len - bytes, 131072);
-		rc = write(fd, packed + bytes, size);
+	while (bytes < buflen) {
+		size_t size = MIN(buflen - bytes, 131072);
+		rc = write(fd, buf + bytes, size);
 		if (rc < 0) {
 			error = errno;
-			fnvlist_pack_free(packed, len);
+			kmem_free(buf, buflen);
 			(void) close(fd);
 			(void) unlink(tmppath);
 			return (error);
@@ -1339,10 +1351,10 @@ vdev_draid_config_write_file(const char *path, char *key, nvlist_t *cfg)
 		}
 	}
 
-	fnvlist_pack_free(packed, len);
+	kmem_free(buf, buflen);
 	close(fd);
 
-	if (bytes != len) {
+	if (bytes != buflen) {
 		(void) unlink(tmppath);
 		return (EIO);
 	}

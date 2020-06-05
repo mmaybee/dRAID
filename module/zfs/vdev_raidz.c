@@ -1687,10 +1687,9 @@ raidz_debug_map(zio_t *zio, raidz_map_t *rm, int error)
 		}
 
 		zfs_dbgmsg("%c: dev %llu off %llu, sz %llu, "
-		    "err %d, skipped %d, tried %d abd_sz %d", t,
+		    "err %d, skipped %d, tried %d", t,
 		    rc->rc_devidx, rc->rc_offset, rc->rc_size,
-		    rc->rc_error, rc->rc_skipped, rc->rc_tried,
-		    abd_get_size(rc->rc_abd));
+		    rc->rc_error, rc->rc_skipped, rc->rc_tried);
 	}
 }
 
@@ -2396,7 +2395,7 @@ done:
 	}
 }
 
-static void
+void
 vdev_raidz_state_change(vdev_t *vd, int faulted, int degraded)
 {
 	if (faulted > vd->vdev_nparity)

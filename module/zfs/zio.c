@@ -3775,7 +3775,6 @@ zio_vdev_io_start(zio_t *zio)
 	}
 
 	if (vd->vdev_ops->vdev_op_leaf &&
-	    vd->vdev_ops != &vdev_draid_spare_ops &&
 	    (zio->io_type == ZIO_TYPE_READ ||
 	    zio->io_type == ZIO_TYPE_WRITE ||
 	    zio->io_type == ZIO_TYPE_TRIM)) {
@@ -3815,8 +3814,7 @@ zio_vdev_io_done(zio_t *zio)
 	if (zio->io_delay)
 		zio->io_delay = gethrtime() - zio->io_delay;
 
-	if (vd != NULL && vd->vdev_ops->vdev_op_leaf &&
-	    vd->vdev_ops != &vdev_draid_spare_ops) {
+	if (vd != NULL && vd->vdev_ops->vdev_op_leaf) {
 		vdev_queue_io_done(zio);
 
 		if (zio->io_type == ZIO_TYPE_WRITE)
