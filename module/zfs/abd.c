@@ -410,7 +410,6 @@ void
 abd_gang_add(abd_t *pabd, abd_t *cabd, boolean_t free_on_free)
 {
 	ASSERT(abd_is_gang(pabd));
-	ASSERT(!abd_is_gang(cabd));
 	abd_t *child_abd = NULL;
 
 	/*
