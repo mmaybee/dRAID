@@ -1475,8 +1475,7 @@ vdev_draid_spare_io_start(zio_t *zio)
 	switch (zio->io_type) {
 	case ZIO_TYPE_IOCTL:
 		zio->io_error = vdev_draid_spare_ioctl(zio);
-		zio_execute(zio);
-		return;
+		break;
 
 	case ZIO_TYPE_WRITE:
 		if (VDEV_OFFSET_IS_LABEL(vd, zio->io_offset)) {
@@ -1494,24 +1493,19 @@ vdev_draid_spare_io_start(zio_t *zio)
 			} else {
 				zio->io_error = SET_ERROR(EIO);
 			}
-
-			zio_interrupt(zio);
 		} else {
 			cvd = vdev_draid_spare_get_child(vd, offset);
 
 			if (cvd == NULL || !vdev_writeable(cvd)) {
 				zio->io_error = SET_ERROR(ENXIO);
-				zio_interrupt(zio);
 			} else {
 				zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
 				    offset, zio->io_abd, zio->io_size,
 				    zio->io_type, zio->io_priority, 0,
 				    vdev_draid_spare_child_done, zio));
-				zio_execute(zio);
 			}
 		}
-
-		return;
+		break;
 
 	case ZIO_TYPE_READ:
 		if (VDEV_OFFSET_IS_LABEL(vd, zio->io_offset)) {
@@ -1527,24 +1521,19 @@ vdev_draid_spare_io_start(zio_t *zio)
 			} else {
 				zio->io_error = SET_ERROR(EIO);
 			}
-
-			zio_interrupt(zio);
 		} else {
 			cvd = vdev_draid_spare_get_child(vd, offset);
 
 			if (cvd == NULL || !vdev_readable(cvd)) {
 				zio->io_error = SET_ERROR(ENXIO);
-				zio_interrupt(zio);
 			} else {
 				zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
 				    offset, zio->io_abd, zio->io_size,
 				    zio->io_type, zio->io_priority, 0,
 				    vdev_draid_spare_child_done, zio));
-				zio_execute(zio);
 			}
 		}
-
-		return;
+		break;
 
 	case ZIO_TYPE_TRIM:
 		/* The vdev label ranges are never trimmed */
@@ -1554,22 +1543,20 @@ vdev_draid_spare_io_start(zio_t *zio)
 
 		if (cvd == NULL || !cvd->vdev_has_trim) {
 			zio->io_error = SET_ERROR(ENXIO);
-			zio_interrupt(zio);
 		} else {
 			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
 			    offset, zio->io_abd, zio->io_size,
 			    zio->io_type, zio->io_priority, 0,
 			    vdev_draid_spare_child_done, zio));
-			zio_execute(zio);
 		}
-
-		return;
+		break;
 
 	default:
 		zio->io_error = SET_ERROR(ENOTSUP);
-		zio_interrupt(zio);
-		return;
+		break;
 	}
+
+	zio_execute(zio);
 }
 
 /* ARGSUSED */
