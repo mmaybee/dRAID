@@ -781,6 +781,26 @@ vdev_draid_close(vdev_t *vd)
 }
 
 /*
+ * Open spare vdevs.
+ */
+static boolean_t
+vdev_draid_open_spares(vdev_t *vd)
+{
+	return (vd->vdev_ops == &vdev_draid_spare_ops ||
+	    vd->vdev_ops == &vdev_replacing_ops ||
+	    vd->vdev_ops == &vdev_spare_ops);
+}
+
+/*
+ * Open all children, excluding spares.
+ */
+static boolean_t
+vdev_draid_open_children(vdev_t *vd)
+{
+	return (!vdev_draid_open_spares(vd));
+}
+
+/*
  * Open a top-level dRAID vdev.
  */
 static int
@@ -820,7 +840,13 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 		vd->vdev_tsd = vdc;
 	}
 
-	vdev_open_children(vd);
+	/*
+	 * First open the normal children then the distributed spares.  This
+	 * ordering is important to ensure the distributed spares caclulate
+	 * the correct psize in the event that the dRAID vdevs were expanded.
+	 */
+	vdev_open_children_subset(vd, vdev_draid_open_children);
+	vdev_open_children_subset(vd, vdev_draid_open_spares);
 
 	/* Verify enough of the children are avaiable to continue. */
 	for (int c = 0; c < vd->vdev_children; c++) {
@@ -836,23 +862,6 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 
 	*asize = *asize * (vd->vdev_children - vdc->vdc_spares);
 	*max_asize = *max_asize * (vd->vdev_children - vdc->vdc_spares);
-
-	/*
-	 * Active distributed spares must be closed and reopened to calculate
-	 * the correct psize in the event that the dRAID vdevs were expanded.
-	 */
-	spa_aux_vdev_t *sav = &vd->vdev_spa->spa_spares;
-
-	for (int i = 0; i < sav->sav_count; i++) {
-		vdev_t *svd = sav->sav_vdevs[i];
-
-		if ((vd->vdev_ops == &vdev_draid_spare_ops) &&
-		    (vdev_draid_spare_get_parent(svd) == vd) &&
-		    (vdev_draid_spare_is_active(svd))) {
-			vdev_close(svd);
-			vdev_open(svd);
-		}
-	}
 
 	return (0);
 }

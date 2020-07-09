@@ -49,10 +49,13 @@ typedef enum vdev_dtl_type {
 
 extern int zfs_nocacheflush;
 
+typedef boolean_t vdev_open_children_func_t(vdev_t *vd);
+
 extern void vdev_dbgmsg(vdev_t *vd, const char *fmt, ...);
 extern void vdev_dbgmsg_print_tree(vdev_t *, int);
 extern int vdev_open(vdev_t *);
 extern void vdev_open_children(vdev_t *);
+extern void vdev_open_children_subset(vdev_t *, vdev_open_children_func_t *);
 extern int vdev_validate(vdev_t *);
 extern int vdev_copy_path_strict(vdev_t *, vdev_t *);
 extern void vdev_copy_path_relaxed(vdev_t *, vdev_t *);
