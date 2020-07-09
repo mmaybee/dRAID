@@ -3774,7 +3774,13 @@ zio_vdev_io_start(zio_t *zio)
 		return (zio);
 	}
 
+	/*
+	 * Select the next best leaf I/O to process.  Distributed spares are
+	 * excluded since they dispatch the I/O directly to a leaf vdev after
+	 * applying the dRAID mapping.
+	 */
 	if (vd->vdev_ops->vdev_op_leaf &&
+	    vd->vdev_ops != &vdev_draid_spare_ops &&
 	    (zio->io_type == ZIO_TYPE_READ ||
 	    zio->io_type == ZIO_TYPE_WRITE ||
 	    zio->io_type == ZIO_TYPE_TRIM)) {
@@ -3814,7 +3820,8 @@ zio_vdev_io_done(zio_t *zio)
 	if (zio->io_delay)
 		zio->io_delay = gethrtime() - zio->io_delay;
 
-	if (vd != NULL && vd->vdev_ops->vdev_op_leaf) {
+	if (vd != NULL && vd->vdev_ops->vdev_op_leaf &&
+	    vd->vdev_ops != &vdev_draid_spare_ops) {
 		vdev_queue_io_done(zio);
 
 		if (zio->io_type == ZIO_TYPE_WRITE)

@@ -50,32 +50,32 @@ for replace_mode in "healing" "sequential"; do
 		flags=""
 	fi
 
+	#
+	# XXX - Checksum errors may still occur when rebuilding to the
+	# second (or later) distibuted spare.  When only a single distributed
+	# spare is available checksum errors are never observed.
+	#
 	parity=$(random_int_between 1 3)
 	spares=$(random_int_between $parity 3)
 	groups=$(random_int_between 1 3)
 	draid="draid${parity}:${groups}g:${spares}s"
+
 	(( min_children = (groups * (parity + 1)) + spares ))
 
 	typeset -i cnt=$(random_int_between $min_children 20)
 
 	setup_test_env $TESTPOOL $draid $cnt
 
-	# XXX - A small number of checksum errors have been observed when
-	# replacing to the distributed spare.  This must be resolved, but
-	# for the moment perform the replacement to a traditional spare.
-	log_must truncate -s $MINVDEVSIZE $BASEDIR/spare0
-	log_must truncate -s $MINVDEVSIZE $BASEDIR/spare1
-	log_must truncate -s $MINVDEVSIZE $BASEDIR/spare2
-
 	i=0
 	while [[ $i -lt $spares ]]; do
 		fault_vdev="$BASEDIR/vdev$i"
-		#spare_vdev="$BASEDIR/spare$i"
 		spare_vdev="s${i}-${draid}-0"
 		log_must zpool offline -f $TESTPOOL $fault_vdev
 		log_must zpool replace -w $flags $TESTPOOL \
 		    $fault_vdev $spare_vdev
 		log_must zpool detach $TESTPOOL $fault_vdev
+		is_pool_scrubbing $TESTPOOL && wait_scrubbed $TESTPOOL
+
 		(( i += 1 ))
 	done
 
