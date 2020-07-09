@@ -1655,12 +1655,21 @@ vdev_uses_zvols(vdev_t *vd)
 }
 
 /*
- * Opens all of the vdev's children.  If any of the leaf vdevs are using
+ * Returns B_TRUE if the passed child should be opened.
+ */
+static boolean_t
+vdev_default_open_children_func(vdev_t *vd)
+{
+	return (B_TRUE);
+}
+
+/*
+ * Open the requested child vdevs.  If any of the leaf vdevs are using
  * a ZFS volume then do the opens in a single thread.  This avoids a
  * deadlock when the current thread is holding the spa_namespace_lock.
  */
-void
-vdev_open_children(vdev_t *vd)
+static void
+vdev_open_children_impl(vdev_t *vd, vdev_open_children_func_t *open_func)
 {
 	int children = vd->vdev_children;
 
@@ -1670,6 +1679,9 @@ vdev_open_children(vdev_t *vd)
 
 	for (int c = 0; c < children; c++) {
 		vdev_t *cvd = vd->vdev_child[c];
+
+		if (open_func(cvd) == B_FALSE)
+			continue;
 
 		if (tq == NULL || vdev_uses_zvols(vd)) {
 			cvd->vdev_open_error = vdev_open(cvd);
@@ -1685,6 +1697,24 @@ vdev_open_children(vdev_t *vd)
 		taskq_wait(tq);
 		taskq_destroy(tq);
 	}
+}
+
+/*
+ * Open all child vdevs.
+ */
+void
+vdev_open_children(vdev_t *vd)
+{
+	vdev_open_children_impl(vd, vdev_default_open_children_func);
+}
+
+/*
+ * Conditionally open a subset of child vdevs.
+ */
+void
+vdev_open_children_subset(vdev_t *vd, vdev_open_children_func_t *open_func)
+{
+	vdev_open_children_impl(vd, open_func);
 }
 
 /*
