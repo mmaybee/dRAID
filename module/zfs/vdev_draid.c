@@ -608,7 +608,6 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	boolean_t degraded = B_FALSE;
 	zio_t *zio;
 	int dummy_data;
-	char buf[128];
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
@@ -619,7 +618,6 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	zio->io_size = MAX(SPA_MINBLOCKSIZE, 1ULL << ashift);
 	zio->io_abd = abd_get_from_buf(&dummy_data, zio->io_size);
 
-	buf[0] = '\0';
 	raidz_map_t *rm = vdev_draid_map_alloc(zio);
 
 	uint64_t group __maybe_unused = vdev_draid_offset_to_group(vd, offset);
@@ -637,28 +635,6 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 			degraded = B_TRUE;
 			status = "*";
 		}
-		if (zfs_flags & ZFS_DEBUG_DRAID) {
-			snprintf(buf + strlen(buf),
-			    sizeof (buf) - strlen(buf), "%llu%s ",
-			    (u_longlong_t)cvd->vdev_id, status);
-		}
-	}
-
-	if (zfs_flags & ZFS_DEBUG_DRAID) {
-		snprintf(buf + strlen(buf), sizeof (buf) - strlen(buf),
-		    "spares: ");
-		for (int c = 0; c < vdc->vdc_spares; c++) {
-			snprintf(buf + strlen(buf),
-			    sizeof (buf) - strlen(buf), "%llu",
-			    (u_longlong_t)vdev_draid_permute_id(vdc,
-			    offset >> DRAID_SLICESHIFT,
-			    vdc->vdc_children - 1 - c));
-		}
-
-		zfs_dbgmsg("%s dRAID, fault_guid=%llu, at %lluK of %lluK: %s",
-		    degraded ? "Degraded" : "Healthy",
-		    fault_vdev ? (u_longlong_t)fault_vdev->vdev_guid : 0,
-		    offset >> 10, size >> 10, buf);
 	}
 
 	(*zio->io_vsd_ops->vsd_free)(zio);

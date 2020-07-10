@@ -1655,45 +1655,6 @@ vdev_raidz_child_done(zio_t *zio)
 	rc->rc_skipped = 0;
 }
 
-/*
- * Log the raidz_map_t used for the failed I/O.  This functionality can
- * be removed when ZFS_DEBUG_DRAID is removed.
- */
-void
-raidz_debug_map(zio_t *zio, raidz_map_t *rm, int error)
-{
-	zfs_dbgmsg("raidz zio: off %llu sz %llu data %px error %d",
-	    zio->io_offset, zio->io_size, zio->io_abd, error);
-
-	for (int c = 0; rm != NULL && c < rm->rm_scols; c++) {
-		char t = 'D';
-		raidz_col_t *rc = &rm->rm_col[c];
-
-		if (c >= rm->rm_cols) {
-			t = 'S';
-		} else if (c < rm->rm_firstdatacol) {
-			switch (c) {
-			case 0:
-				t = 'P';
-				break;
-			case 1:
-				t = 'Q';
-				break;
-			case 2:
-				t = 'R';
-				break;
-			default:
-				ASSERT0(c);
-			}
-		}
-
-		zfs_dbgmsg("%c: dev %llu off %llu, sz %llu, "
-		    "err %d, skipped %d, tried %d", t,
-		    rc->rc_devidx, rc->rc_offset, rc->rc_size,
-		    rc->rc_error, rc->rc_skipped, rc->rc_tried);
-	}
-}
-
 static void
 vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, int col)
 {
@@ -1853,7 +1814,6 @@ raidz_checksum_error(zio_t *zio, raidz_col_t *rc, abd_t *bad_data)
 
 		mutex_enter(&vd->vdev_stat_lock);
 		vd->vdev_stat.vs_checksum_errors++;
-		raidz_debug_map(zio, rm, rc->rc_devidx);
 		mutex_exit(&vd->vdev_stat_lock);
 
 		zbc.zbc_has_cksum = 0;
