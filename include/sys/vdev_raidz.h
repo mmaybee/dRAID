@@ -50,7 +50,6 @@ int vdev_raidz_reconstruct(struct raidz_map *, const int *, int);
 void vdev_raidz_child_done(zio_t *);
 void vdev_raidz_io_done(zio_t *);
 void vdev_raidz_state_change(vdev_t *, int, int);
-void raidz_debug_map(zio_t *zio, struct raidz_map *, int error);
 
 /*
  * vdev_raidz_math interface
