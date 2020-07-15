@@ -75,7 +75,8 @@ typedef uint64_t vdev_asize_func_t(vdev_t *vd, uint64_t offset, uint64_t psize);
 typedef void	vdev_io_start_func_t(zio_t *zio);
 typedef void	vdev_io_done_func_t(zio_t *zio);
 typedef void	vdev_state_change_func_t(vdev_t *vd, int, int);
-typedef boolean_t vdev_need_resilver_func_t(vdev_t *vd, uint64_t, size_t);
+typedef boolean_t vdev_need_resilver_func_t(vdev_t *vd, const dva_t *dva,
+    size_t psize, uint64_t phys_birth);
 typedef void	vdev_hold_func_t(vdev_t *vd);
 typedef void	vdev_rele_func_t(vdev_t *vd);
 

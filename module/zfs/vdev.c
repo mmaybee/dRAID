@@ -2618,10 +2618,22 @@ vdev_dtl_empty(vdev_t *vd, vdev_dtl_type_t t)
 }
 
 /*
- * Returns B_TRUE if vdev determines offset needs to be resilvered.
+ * Check if the txg falls within the range which must be
+ * resilvered.  DVAs outside this range can always be skipped.
  */
 boolean_t
-vdev_dtl_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
+vdev_default_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
+    uint64_t phys_birth)
+{
+	return (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1));
+}
+
+/*
+ * Returns B_TRUE if the vdev determines the DVA needs to be resilvered.
+ */
+boolean_t
+vdev_dtl_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
+    uint64_t phys_birth)
 {
 	ASSERT(vd != vd->vdev_spa->spa_root_vdev);
 
@@ -2629,7 +2641,8 @@ vdev_dtl_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
 	    vd->vdev_ops->vdev_op_leaf)
 		return (B_TRUE);
 
-	return (vd->vdev_ops->vdev_op_need_resilver(vd, offset, psize));
+	return (vd->vdev_ops->vdev_op_need_resilver(vd, dva, psize,
+	    phys_birth));
 }
 
 /*
