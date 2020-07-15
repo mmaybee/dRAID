@@ -283,6 +283,7 @@ vdev_draid_map_alloc(zio_t *zio)
 		rm->rm_col[c].rc_error = 0;
 		rm->rm_col[c].rc_tried = 0;
 		rm->rm_col[c].rc_skipped = 0;
+		rm->rm_col[c].rc_repair = 0;
 
 		if (c >= rm->rm_cols)
 			rm->rm_col[c].rc_size = 0;
@@ -495,8 +496,6 @@ vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
 boolean_t
 vdev_draid_missing(vdev_t *vd, uint64_t offset, uint64_t txg, uint64_t size)
 {
-	int c;
-
 	if (vdev_dtl_contains(vd, DTL_MISSING, txg, size))
 		return (B_TRUE);
 
@@ -512,7 +511,7 @@ vdev_draid_missing(vdev_t *vd, uint64_t offset, uint64_t txg, uint64_t size)
 	if (vdev_dtl_contains(vd, DTL_MISSING, txg, size))
 		return (B_TRUE);
 
-	for (c = 0; c < vd->vdev_children; c++) {
+	for (int c = 0; c < vd->vdev_children; c++) {
 		vdev_t *cvd = vd->vdev_child[c];
 
 		if (!vdev_readable(cvd))
@@ -537,14 +536,7 @@ vdev_draid_readable(vdev_t *vd, uint64_t offset)
 			return (B_FALSE);
 	}
 
-	if (vd->vdev_ops != &vdev_spare_ops)
-		return (vdev_readable(vd));
-
-	for (int c = 0; c < vd->vdev_children; c++)
-		if (vdev_draid_readable(vd->vdev_child[c], offset))
-			return (B_TRUE);
-
-	return (B_FALSE);
+	return (vdev_readable(vd));
 }
 
 /*
@@ -570,6 +562,24 @@ vdev_draid_guid_exists(vdev_t *vd, uint64_t guid, uint64_t offset)
 			return (B_TRUE);
 
 	return (B_FALSE);
+}
+
+/*
+ * Returns the first distributed spare found under the provided vdev tree.
+ */
+static vdev_t *
+vdev_draid_find_spare(vdev_t *vd)
+{
+	if (vd->vdev_ops == &vdev_draid_spare_ops)
+		return (vd);
+
+	for (int c = 0; c < vd->vdev_children; c++) {
+		vdev_t *svd = vdev_draid_find_spare(vd->vdev_child[c]);
+		if (svd != NULL)
+			return (svd);
+	}
+
+	return (NULL);
 }
 
 static boolean_t
@@ -981,14 +991,41 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 }
 
 /*
- * Returns B_TRUE if the block at the offset and size is degraded and
- * needs to be resilvered.
+ * Returns the number of active distributed spares in the dRAID vdev tree.
+ */
+static int
+vdev_draid_active_spares(vdev_t *vd)
+{
+	int spares = 0;
+
+	if (vd->vdev_ops == &vdev_draid_spare_ops)
+		return (1);
+
+	for (int c = 0; c < vd->vdev_children; c++)
+		spares += vdev_draid_active_spares(vd->vdev_child[c]);
+
+	return (spares);
+}
+
+/*
+ * The DVA needs to be resilvered when:
+ *   1. There are multiple active distributed spares.
+ *      See the comment in vdev_draid_io_start(); or
+ *   2. The DVA is within the missing range of the DTL; or
+ *   3. The DVA is degraded and needs to be resilvered.
  */
 static boolean_t
-vdev_draid_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
+vdev_draid_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
+    uint64_t phys_birth)
 {
-	ASSERT3U(vdev_draid_offset_to_group(vd, offset), ==,
-	    vdev_draid_offset_to_group(vd, offset + psize - 1));
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
+	uint64_t offset = DVA_GET_OFFSET(dva);
+
+	if (vdc->vdc_spares > 1 && vdev_draid_active_spares(vd) > 1)
+		return (B_TRUE);
+
+	if (!vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
+		return (B_FALSE);
 
 	return (vdev_draid_group_degraded(vd, NULL, offset, psize));
 }
@@ -1057,6 +1094,7 @@ vdev_draid_io_start(zio_t *zio)
 	for (int c = rm->rm_cols - 1; c >= 0; c--) {
 		raidz_col_t *rc = &rm->rm_col[c];
 		vdev_t *cvd = vd->vdev_child[rc->rc_devidx];
+		vdev_t *svd;
 
 		if (!vdev_draid_readable(cvd, rc->rc_offset)) {
 			if (c >= rm->rm_firstdatacol)
@@ -1077,6 +1115,22 @@ vdev_draid_io_start(zio_t *zio)
 			rc->rc_error = SET_ERROR(ESTALE);
 			rc->rc_skipped = 1;
 			continue;
+		}
+
+		/*
+		 * If this child is a distributed spare and we're resilvering
+		 * then this offset might reside on the vdev being replaced.
+		 * In which case this data must be written to the new device.
+		 * Failure to do so would result in checksum errors when the
+		 * old device is detached and the pool is scrubbed.
+		 */
+		if (zio->io_flags & ZIO_FLAG_RESILVER &&
+		    (svd = vdev_draid_find_spare(cvd)) != NULL) {
+			svd = vdev_draid_spare_get_child(svd, rc->rc_offset);
+			if (svd->vdev_ops == &vdev_spare_ops ||
+			    svd->vdev_ops == &vdev_replacing_ops) {
+				rc->rc_repair = 1;
+			}
 		}
 
 		if (c >= rm->rm_firstdatacol || rm->rm_missingdata > 0 ||
@@ -1257,14 +1311,14 @@ vdev_draid_spare_is_active(vdev_t *vd)
 }
 
 /*
- * Expects a dRAID distribute spare vdev and returns the child vdev on which
- * the provied offset resides.
+ * Expects a dRAID distribute spare vdev and returns the physical child vdev
+ * on which the provied offset resides.  This may involve recursing through
+ * multiple layers of distributed spares.
  */
 static vdev_t *
 vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 {
 	vdev_draid_spare_t *vds = vd->vdev_tsd;
-	uint64_t spare_id;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
 
@@ -1280,10 +1334,14 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 	ASSERT3P(tvd->vdev_ops, ==, &vdev_draid_ops);
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
 
-	spare_id = vdev_draid_permute_id(vdc, offset >> DRAID_SLICESHIFT,
+	uint64_t top_id = vdev_draid_permute_id(vdc, offset >> DRAID_SLICESHIFT,
 	    (tvd->vdev_children - 1) - vds->vds_spare_id);
+	vdev_t *cvd = tvd->vdev_child[top_id];
 
-	return (tvd->vdev_child[spare_id]);
+	if (cvd->vdev_ops == &vdev_draid_spare_ops)
+		return (vdev_draid_spare_get_child(cvd, offset));
+
+	return (cvd);
 }
 
 /*

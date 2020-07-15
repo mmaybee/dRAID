@@ -50,11 +50,6 @@ for replace_mode in "healing" "sequential"; do
 		flags=""
 	fi
 
-	#
-	# XXX - Checksum errors may still occur when rebuilding to the
-	# second (or later) distibuted spare.  When only a single distributed
-	# spare is available checksum errors are never observed.
-	#
 	parity=$(random_int_between 1 3)
 	spares=$(random_int_between $parity 3)
 	groups=$(random_int_between 1 3)

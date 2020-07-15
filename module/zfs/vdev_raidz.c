@@ -430,6 +430,7 @@ vdev_raidz_map_alloc(zio_t *zio, uint64_t ashift, uint64_t dcols,
 		rm->rm_col[c].rc_error = 0;
 		rm->rm_col[c].rc_tried = 0;
 		rm->rm_col[c].rc_skipped = 0;
+		rm->rm_col[c].rc_repair = 0;
 
 		if (c >= acols)
 			rm->rm_col[c].rc_size = 0;
@@ -2381,7 +2382,7 @@ done:
 			rc = &rm->rm_col[c];
 			cvd = vd->vdev_child[rc->rc_devidx];
 
-			if (rc->rc_error == 0)
+			if (rc->rc_error == 0 && rc->rc_repair == 0)
 				continue;
 
 			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
@@ -2414,17 +2415,21 @@ vdev_raidz_state_change(vdev_t *vd, int faulted, int degraded)
  * width blocks must be resilvered.
  */
 static boolean_t
-vdev_raidz_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
+vdev_raidz_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
+    uint64_t phys_birth)
 {
 	uint64_t dcols = vd->vdev_children;
 	uint64_t nparity = vd->vdev_nparity;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
 	/* The starting RAIDZ (parent) vdev sector of the block. */
-	uint64_t b = offset >> ashift;
+	uint64_t b =  DVA_GET_OFFSET(dva) >> ashift;
 	/* The zio's size in units of the vdev's minimum sector size. */
 	uint64_t s = ((psize - 1) >> ashift) + 1;
 	/* The first column for this stripe. */
 	uint64_t f = b % dcols;
+
+	if (!vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
+		return (B_FALSE);
 
 	if (s + nparity >= dcols)
 		return (B_TRUE);
