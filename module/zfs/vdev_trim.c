@@ -607,6 +607,32 @@ vdev_trim_ranges(trim_args_t *ta)
 	return (0);
 }
 
+static void
+vdev_trim_xlate_last_rs_end(void *arg, range_seg64_t *physical_rs)
+{
+	uint64_t *last_rs_end = (uint64_t *)arg;
+
+	if (physical_rs->rs_end > *last_rs_end)
+		*last_rs_end = physical_rs->rs_end;
+}
+
+static void
+vdev_trim_xlate_progress(void *arg, range_seg64_t *physical_rs)
+{
+	vdev_t *vd = (vdev_t *)arg;
+
+	uint64_t size = physical_rs->rs_end - physical_rs->rs_start;
+	vd->vdev_trim_bytes_est += size;
+
+	if (vd->vdev_trim_last_offset >= physical_rs->rs_end) {
+		vd->vdev_trim_bytes_done += size;
+	} else if (vd->vdev_trim_last_offset > physical_rs->rs_start &&
+	    vd->vdev_trim_last_offset <= physical_rs->rs_end) {
+		vd->vdev_trim_bytes_done +=
+		    vd->vdev_trim_last_offset - physical_rs->rs_start;
+	}
+}
+
 /*
  * Calculates the completion percentage of a manual TRIM.
  */
@@ -627,24 +653,38 @@ vdev_trim_calculate_progress(vdev_t *vd)
 		uint64_t ms_free = msp->ms_size -
 		    metaslab_allocated_space(msp);
 
-		if (vd->vdev_top->vdev_ops == &vdev_raidz_ops)
+		if (vd->vdev_top->vdev_ops == &vdev_raidz_ops) {
 			ms_free /= vd->vdev_top->vdev_children;
+		} else if (vd->vdev_top->vdev_ops == &vdev_draid_ops) {
+			ms_free /= (vd->vdev_top->vdev_children -
+			    vd->vdev_top->vdev_spares);
+		}
 
 		/*
 		 * Convert the metaslab range to a physical range
 		 * on our vdev. We use this to determine if we are
 		 * in the middle of this metaslab range.
 		 */
-		range_seg64_t logical_rs, physical_rs;
+		range_seg64_t logical_rs, physical_rs, remain_rs;
 		logical_rs.rs_start = msp->ms_start;
 		logical_rs.rs_end = msp->ms_start + msp->ms_size;
-		vdev_xlate(vd, &logical_rs, &physical_rs);
 
+		/* Metaslab space after this offset has not been trimmed. */
+		vdev_xlate(vd, &logical_rs, &physical_rs, &remain_rs);
 		if (vd->vdev_trim_last_offset <= physical_rs.rs_start) {
 			vd->vdev_trim_bytes_est += ms_free;
 			mutex_exit(&msp->ms_lock);
 			continue;
-		} else if (vd->vdev_trim_last_offset > physical_rs.rs_end) {
+		}
+
+		/* Metaslab space before this offset has been trimmed */
+		uint64_t last_rs_end = physical_rs.rs_end;
+		if (!vdev_xlate_is_empty(&remain_rs)) {
+			vdev_xlate_walk(vd, &remain_rs,
+			    vdev_trim_xlate_last_rs_end, &last_rs_end);
+		}
+
+		if (vd->vdev_trim_last_offset > last_rs_end) {
 			vd->vdev_trim_bytes_done += ms_free;
 			vd->vdev_trim_bytes_est += ms_free;
 			mutex_exit(&msp->ms_lock);
@@ -665,21 +705,9 @@ vdev_trim_calculate_progress(vdev_t *vd)
 		    rs != NULL; rs = zfs_btree_next(bt, &idx, &idx)) {
 			logical_rs.rs_start = rs_get_start(rs, rt);
 			logical_rs.rs_end = rs_get_end(rs, rt);
-			vdev_xlate(vd, &logical_rs, &physical_rs);
 
-			uint64_t size = physical_rs.rs_end -
-			    physical_rs.rs_start;
-			vd->vdev_trim_bytes_est += size;
-			if (vd->vdev_trim_last_offset >= physical_rs.rs_end) {
-				vd->vdev_trim_bytes_done += size;
-			} else if (vd->vdev_trim_last_offset >
-			    physical_rs.rs_start &&
-			    vd->vdev_trim_last_offset <=
-			    physical_rs.rs_end) {
-				vd->vdev_trim_bytes_done +=
-				    vd->vdev_trim_last_offset -
-				    physical_rs.rs_start;
-			}
+			vdev_xlate_walk(vd, &logical_rs,
+			    vdev_trim_xlate_progress, vd);
 		}
 		mutex_exit(&msp->ms_lock);
 	}
@@ -747,8 +775,38 @@ vdev_trim_load(vdev_t *vd)
 	return (err);
 }
 
+static void
+vdev_trim_xlate_range_add(void *arg, range_seg64_t *physical_rs)
+{
+	trim_args_t *ta = arg;
+	vdev_t *vd = ta->trim_vdev;
+
+	/*
+	 * Only a manual trim will be traversing the vdev sequentially.
+	 * For an auto trim all valid ranges should be added.
+	 */
+	if (ta->trim_type == TRIM_TYPE_MANUAL) {
+
+		/* Only add segments that we have not visited yet */
+		if (physical_rs->rs_end <= vd->vdev_trim_last_offset)
+			return;
+
+		/* Pick up where we left off mid-range. */
+		if (vd->vdev_trim_last_offset > physical_rs->rs_start) {
+			ASSERT3U(physical_rs->rs_end, >,
+			    vd->vdev_trim_last_offset);
+			physical_rs->rs_start = vd->vdev_trim_last_offset;
+		}
+	}
+
+	ASSERT3U(physical_rs->rs_end, >, physical_rs->rs_start);
+
+	range_tree_add(ta->trim_tree, physical_rs->rs_start,
+	    physical_rs->rs_end - physical_rs->rs_start);
+}
+
 /*
- * Convert the logical range into a physical range and add it to the
+ * Convert the logical range into physical ranges and add them to the
  * range tree passed in the trim_args_t.
  */
 static void
@@ -756,7 +814,7 @@ vdev_trim_range_add(void *arg, uint64_t start, uint64_t size)
 {
 	trim_args_t *ta = arg;
 	vdev_t *vd = ta->trim_vdev;
-	range_seg64_t logical_rs, physical_rs;
+	range_seg64_t logical_rs;
 	logical_rs.rs_start = start;
 	logical_rs.rs_end = start + size;
 
@@ -773,44 +831,7 @@ vdev_trim_range_add(void *arg, uint64_t start, uint64_t size)
 	}
 
 	ASSERT(vd->vdev_ops->vdev_op_leaf);
-	vdev_xlate(vd, &logical_rs, &physical_rs);
-
-	IMPLY(vd->vdev_top == vd,
-	    logical_rs.rs_start == physical_rs.rs_start);
-	IMPLY(vd->vdev_top == vd,
-	    logical_rs.rs_end == physical_rs.rs_end);
-
-	/*
-	 * Only a manual trim will be traversing the vdev sequentially.
-	 * For an auto trim all valid ranges should be added.
-	 */
-	if (ta->trim_type == TRIM_TYPE_MANUAL) {
-
-		/* Only add segments that we have not visited yet */
-		if (physical_rs.rs_end <= vd->vdev_trim_last_offset)
-			return;
-
-		/* Pick up where we left off mid-range. */
-		if (vd->vdev_trim_last_offset > physical_rs.rs_start) {
-			ASSERT3U(physical_rs.rs_end, >,
-			    vd->vdev_trim_last_offset);
-			physical_rs.rs_start = vd->vdev_trim_last_offset;
-		}
-	}
-
-	ASSERT3U(physical_rs.rs_end, >=, physical_rs.rs_start);
-
-	/*
-	 * With raidz, it's possible that the logical range does not live on
-	 * this leaf vdev. We only add the physical range to this vdev's if it
-	 * has a length greater than 0.
-	 */
-	if (physical_rs.rs_end > physical_rs.rs_start) {
-		range_tree_add(ta->trim_tree, physical_rs.rs_start,
-		    physical_rs.rs_end - physical_rs.rs_start);
-	} else {
-		ASSERT3U(physical_rs.rs_end, ==, physical_rs.rs_start);
-	}
+	vdev_xlate_walk(vd, &logical_rs, vdev_trim_xlate_range_add, arg);
 }
 
 /*

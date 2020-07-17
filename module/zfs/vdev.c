@@ -5006,23 +5006,15 @@ vdev_clear_resilver_deferred(vdev_t *vd, dmu_tx_t *tx)
 	    vdev_resilver_needed(vd, NULL, NULL));
 }
 
-/*
- * Translate a logical range to the physical range for the specified vdev_t.
- * This function is initially called with a leaf vdev and will walk each
- * parent vdev until it reaches a top-level vdev. Once the top-level is
- * reached the physical range is initialized and the recursive function
- * begins to unwind. As it unwinds it calls the parent's vdev specific
- * translation function to do the real conversion.
- */
-void
-vdev_xlate(vdev_t *vd, const range_seg64_t *logical_rs,
+static void
+vdev_xlate_impl(vdev_t *vd, const range_seg64_t *logical_rs,
     range_seg64_t *physical_rs)
 {
 	/*
 	 * Walk up the vdev tree
 	 */
 	if (vd != vd->vdev_top) {
-		vdev_xlate(vd->vdev_parent, logical_rs, physical_rs);
+		vdev_xlate_impl(vd->vdev_parent, logical_rs, physical_rs);
 	} else {
 		/*
 		 * We've reached the top-level vdev, initialize the
@@ -5048,6 +5040,80 @@ vdev_xlate(vdev_t *vd, const range_seg64_t *logical_rs,
 
 	physical_rs->rs_start = intermediate.rs_start;
 	physical_rs->rs_end = intermediate.rs_end;
+}
+
+boolean_t
+vdev_xlate_is_empty(range_seg64_t *rs)
+{
+	return (rs->rs_start == rs->rs_end);
+}
+
+/*
+ * Translate a logical range to the first contiguous physical range for the
+ * specified vdev_t.  This function is initially called with a leaf vdev and
+ * will walk each parent vdev until it reaches a top-level vdev. Once the
+ * top-level is reached the physical range is initialized and the recursive
+ * function begins to unwind. As it unwinds it calls the parent's vdev
+ * specific translation function to do the real conversion.
+ */
+void
+vdev_xlate(vdev_t *vd, const range_seg64_t *logical_rs,
+    range_seg64_t *physical_rs, range_seg64_t *remain_rs)
+{
+	vdev_t *tvd = vd->vdev_top;
+	uint64_t len = logical_rs->rs_end - logical_rs->rs_start;
+
+	/*
+	 * Unlike with mirrors and raidz, a dRAID logical ranges can map
+	 * to multiple non-contiguous physical ranges.  This is handled by
+	 * returning the first physical range and setting remain_rs such
+	 * that is describes the remaining unmapped logical range.  See
+	 * vdev_draid_xlate() for additional details.
+	 */
+	if (tvd->vdev_ops == &vdev_draid_ops) {
+		uint64_t group, rs_start = logical_rs->rs_start;
+
+		group = vdev_draid_offset_to_group(tvd, rs_start);
+		len = vdev_draid_group_to_offset(tvd, group + 1) - rs_start;
+
+		range_seg64_t draid_rs;
+		draid_rs.rs_start = rs_start;
+		draid_rs.rs_end = MIN(rs_start + len, logical_rs->rs_end);
+
+		vdev_xlate_impl(vd, &draid_rs, physical_rs);
+
+		remain_rs->rs_start = draid_rs.rs_end;
+		remain_rs->rs_end = logical_rs->rs_end;
+	} else {
+		vdev_xlate_impl(vd, logical_rs, physical_rs);
+
+		remain_rs->rs_start = logical_rs->rs_end;
+		remain_rs->rs_end = logical_rs->rs_end;
+	}
+}
+
+void
+vdev_xlate_walk(vdev_t *vd, const range_seg64_t *logical_rs,
+    vdev_xlate_func_t *func, void *arg)
+{
+	range_seg64_t iter_rs = *logical_rs;
+	range_seg64_t physical_rs;
+	range_seg64_t remain_rs;
+
+	while (!vdev_xlate_is_empty(&iter_rs)) {
+
+		vdev_xlate(vd, &iter_rs, &physical_rs, &remain_rs);
+
+		/*
+		 * With raidz and dRAID, it's possible that the logical range
+		 * does not live on this leaf vdev. Only when there is a non-
+		 * zero physical size call the provided function.
+		 */
+		if (!vdev_xlate_is_empty(&physical_rs))
+			func(arg, &physical_rs);
+
+		iter_rs = remain_rs;
+	}
 }
 
 /*

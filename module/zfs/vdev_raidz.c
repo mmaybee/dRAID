@@ -1662,7 +1662,7 @@ vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, int col)
 	vdev_t *vd = zio->io_vd;
 	vdev_t *tvd = vd->vdev_top;
 
-	range_seg64_t logical_rs, physical_rs;
+	range_seg64_t logical_rs, physical_rs, remain_rs;
 	logical_rs.rs_start = zio->io_offset;
 	logical_rs.rs_end = logical_rs.rs_start +
 	    vdev_raidz_asize(zio->io_vd, zio->io_offset, zio->io_size);
@@ -1670,9 +1670,10 @@ vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, int col)
 	raidz_col_t *rc = &rm->rm_col[col];
 	vdev_t *cvd = vd->vdev_child[rc->rc_devidx];
 
-	vdev_xlate(cvd, &logical_rs, &physical_rs);
+	vdev_xlate(cvd, &logical_rs, &physical_rs, &remain_rs);
 	ASSERT3U(rc->rc_offset, ==, physical_rs.rs_start);
 	ASSERT3U(rc->rc_offset, <, physical_rs.rs_end);
+	ASSERT(vdev_xlate_is_empty(&remain_rs));
 	/*
 	 * It would be nice to assert that rs_end is equal
 	 * to rc_offset + rc_size but there might be an
