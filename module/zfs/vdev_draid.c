@@ -53,22 +53,27 @@ static unsigned int slice_shift = 0;
 #define	DRAID_SLICEMASK  (DRAID_SLICESIZE - 1)
 
 /*
- * Returns the permuted device index for the requested permutation group
- * and device index.
+ * Lookup the permutation base array and iteration id
+ * for the provided offset.
  */
-static uint64_t
-vdev_draid_permute_id(vdev_draid_config_t *vdc, uint64_t permutation_id,
-    uint64_t device_id)
+static void
+vdev_draid_get_perm(vdev_draid_config_t *vdc, uint64_t off,
+    uint64_t **base, uint64_t *iter)
 {
+	uint64_t pindex = off /
+	    ((vdc->vdc_children - vdc->vdc_spares) * DRAID_SLICESIZE);
 	uint64_t ncols = vdc->vdc_children;
-	uint64_t off = permutation_id % (vdc->vdc_bases * ncols);
-	uint64_t base = off / ncols;
-	uint64_t dev = off % ncols;
-	uint64_t *base_perm = vdc->vdc_base_perms + (base * ncols);
+	uint64_t poff = pindex % (vdc->vdc_bases * ncols);
 
-	ASSERT3U(device_id, <, ncols);
+	*base = vdc->vdc_base_perms + (poff / ncols) * ncols;
+	*iter = poff % ncols;
+}
 
-	return ((base_perm[device_id] + dev) % ncols);
+static inline uint64_t
+vdev_draid_permute_id(vdev_draid_config_t *vdc,
+    uint64_t *base, uint64_t iter, uint64_t index)
+{
+	return ((base[index] + iter) % vdc->vdc_children);
 }
 
 /*
@@ -272,11 +277,13 @@ vdev_draid_map_alloc(zio_t *zio)
 	rm->rm_ecksuminjected = 0;
 	rm->rm_include_skip = 1;
 
-	uint64_t asize = 0;
+	uint64_t *base, iter, asize = 0;
+	vdev_draid_get_perm(vdc, zio->io_offset, &base, &iter);
 	for (uint64_t c = 0; c < groupsz; c++) {
 		uint64_t i = groupstart + c;
 
-		rm->rm_col[c].rc_devidx = vdev_draid_permute_id(vdc, perm, i);
+		rm->rm_col[c].rc_devidx =
+		    vdev_draid_permute_id(vdc, base, iter, i);
 		rm->rm_col[c].rc_offset = o;
 		rm->rm_col[c].rc_abd = NULL;
 		rm->rm_col[c].rc_gdata = NULL;
@@ -604,45 +611,26 @@ boolean_t
 vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
     uint64_t size)
 {
-	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	boolean_t degraded = B_FALSE;
-	zio_t *zio;
-	int dummy_data;
+	uint64_t *base, iter;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
+	ASSERT3U(vdev_draid_offset_to_group(vd, offset), ==,
+	    vdev_draid_offset_to_group(vd, offset + size - 1));
 
-	zio = kmem_alloc(sizeof (*zio), KM_SLEEP);
-	zio->io_vd = vd;
-	zio->io_type = ZIO_TYPE_READ;
-	zio->io_offset = offset;
-	zio->io_size = MAX(SPA_MINBLOCKSIZE, 1ULL << ashift);
-	zio->io_abd = abd_get_from_buf(&dummy_data, zio->io_size);
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
+	vdev_draid_get_perm(vdc, offset, &base, &iter);
 
-	raidz_map_t *rm = vdev_draid_map_alloc(zio);
+	uint64_t ncols = vdc->vdc_children;
+	uint64_t coff = (offset / ((ncols - vdc->vdc_spares)
+	    << DRAID_SLICESHIFT)) << DRAID_SLICESHIFT;
+	for (int c = 0; c < ncols; c++) {
+		uint64_t cid = vdev_draid_permute_id(vdc, base, iter, c);
+		vdev_t *cvd = vd->vdev_child[cid];
 
-	uint64_t group __maybe_unused = vdev_draid_offset_to_group(vd, offset);
-	vdev_draid_config_t *vdc __maybe_unused = vd->vdev_tsd;
-	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, offset + size - 1));
-	ASSERT3U(rm->rm_scols, ==,
-	    vdc->vdc_parity + vdc->vdc_data[group % vdc->vdc_groups]);
-
-	for (int c = 0; c < rm->rm_scols; c++) {
-		raidz_col_t *rc = &rm->rm_col[c];
-		vdev_t *cvd = vd->vdev_child[rc->rc_devidx];
-		char *status = "";
-
-		if (vdev_draid_vd_degraded(cvd, fault_vdev, rc->rc_offset)) {
-			degraded = B_TRUE;
-			status = "*";
-		}
+		if (vdev_draid_vd_degraded(cvd, fault_vdev, coff))
+			return(B_TRUE);
 	}
-
-	(*zio->io_vsd_ops->vsd_free)(zio);
-
-	abd_put(zio->io_abd);
-	kmem_free(zio, sizeof (*zio));
-
-	return (degraded);
+	return (B_FALSE);
 }
 
 /*
@@ -1310,9 +1298,11 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 	ASSERT3P(tvd->vdev_ops, ==, &vdev_draid_ops);
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
 
-	uint64_t top_id = vdev_draid_permute_id(vdc, offset >> DRAID_SLICESHIFT,
+	uint64_t *base, iter;
+	vdev_draid_get_perm(vdc, offset * vdc->vdc_children, &base, &iter);
+	uint64_t cid = vdev_draid_permute_id(vdc, base, iter,
 	    (tvd->vdev_children - 1) - vds->vds_spare_id);
-	vdev_t *cvd = tvd->vdev_child[top_id];
+	vdev_t *cvd = tvd->vdev_child[cid];
 
 	if (cvd->vdev_ops == &vdev_draid_spare_ops)
 		return (vdev_draid_spare_get_child(cvd, offset));
