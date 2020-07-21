@@ -57,11 +57,9 @@ static unsigned int slice_shift = 0;
  * for the provided offset.
  */
 static void
-vdev_draid_get_perm(vdev_draid_config_t *vdc, uint64_t off,
+vdev_draid_get_perm(vdev_draid_config_t *vdc, uint64_t pindex,
     uint64_t **base, uint64_t *iter)
 {
-	uint64_t pindex = off /
-	    ((vdc->vdc_children - vdc->vdc_spares) * DRAID_SLICESIZE);
 	uint64_t ncols = vdc->vdc_children;
 	uint64_t poff = pindex % (vdc->vdc_bases * ncols);
 
@@ -278,7 +276,7 @@ vdev_draid_map_alloc(zio_t *zio)
 	rm->rm_include_skip = 1;
 
 	uint64_t *base, iter, asize = 0;
-	vdev_draid_get_perm(vdc, zio->io_offset, &base, &iter);
+	vdev_draid_get_perm(vdc, perm, &base, &iter);
 	for (uint64_t c = 0; c < groupsz; c++) {
 		uint64_t i = groupstart + c;
 
@@ -618,7 +616,9 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	    vdev_draid_offset_to_group(vd, offset + size - 1));
 
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	vdev_draid_get_perm(vdc, offset, &base, &iter);
+	uint64_t pindex = offset /
+	    ((vdc->vdc_children - vdc->vdc_spares) * DRAID_SLICESIZE);
+	vdev_draid_get_perm(vdc, pindex, &base, &iter);
 
 	uint64_t ncols = vdc->vdc_children;
 	uint64_t coff = (offset / ((ncols - vdc->vdc_spares)
@@ -1299,7 +1299,7 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
 
 	uint64_t *base, iter;
-	vdev_draid_get_perm(vdc, offset * vdc->vdc_children, &base, &iter);
+	vdev_draid_get_perm(vdc, offset >> DRAID_SLICESHIFT, &base, &iter);
 	uint64_t cid = vdev_draid_permute_id(vdc, base, iter,
 	    (tvd->vdev_children - 1) - vds->vds_spare_id);
 	vdev_t *cvd = tvd->vdev_child[cid];
