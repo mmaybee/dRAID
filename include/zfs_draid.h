@@ -47,7 +47,7 @@ extern "C" {
  * These values apply reasonable limits to a dRAID configuration.
  */
 #define	VDEV_DRAID_MAX_GROUPSIZE	32
-#define	VDEV_DRAID_MAX_GROUPS		128
+#define	VDEV_DRAID_MAX_GROUPS		VDEV_DRAID_MAX_CHILDREN
 #define	VDEV_DRAID_MAX_SPARES		100
 
 /*
@@ -103,7 +103,7 @@ typedef struct vdev_draid_config {
 	uint64_t vdc_spares;
 	uint64_t vdc_children;
 	uint64_t vdc_bases;
-	uint64_t *vdc_data;
+	uint64_t vdc_data;
 	uint64_t *vdc_base_perms;
 	long int vdc_seed;
 } vdev_draid_config_t;

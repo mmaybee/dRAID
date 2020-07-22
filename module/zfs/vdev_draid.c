@@ -45,7 +45,7 @@
  * dRAID is a distributed parity implementation for ZFS.
  */
 
-static uint64_t vdev_draid_asize_by_type(const vdev_t *, uint64_t, uint64_t);
+static uint64_t vdev_draid_psize_to_asize(const vdev_t *, uint64_t, uint64_t);
 static vdev_t *vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset);
 
 /* A child vdev is divided into slices */
@@ -92,33 +92,41 @@ static void
 vdev_draid_map_alloc_write(zio_t *zio, raidz_map_t *rm)
 {
 	uint64_t skip_size = 1ULL << zio->io_vd->vdev_top->vdev_ashift;
+	uint64_t parity_size = rm->rm_col[0].rc_size;
 	uint64_t abd_off = 0;
 
 	ASSERT3U(zio->io_type, ==, ZIO_TYPE_WRITE);
+	ASSERT3U(parity_size, ==, abd_get_size(rm->rm_col[0].rc_abd));
 
 	for (uint64_t c = rm->rm_firstdatacol; c < rm->rm_scols; c++) {
 		raidz_col_t *rc = &rm->rm_col[c];
 
 		if (rm->rm_skipstart == 0 || c < rm->rm_skipstart) {
+			/* this is a "big column */
+			ASSERT3U(rc->rc_size, ==, parity_size);
 			rc->rc_abd = abd_get_offset_size(zio->io_abd,
 			    abd_off, rc->rc_size);
 		} else if (c < rm->rm_cols) {
+			/* short data column, add a skip sector */
+			ASSERT3U(rc->rc_size + skip_size, ==, parity_size);
 			rc->rc_abd = abd_alloc_gang_abd();
 			abd_gang_add(rc->rc_abd, abd_get_offset_size(
 			    zio->io_abd, abd_off, rc->rc_size), B_TRUE);
 			abd_gang_add(rc->rc_abd, abd_get_zeros(skip_size),
 			    B_TRUE);
 		} else {
+			ASSERT0(rc->rc_size);
+			ASSERT3U(skip_size, ==, parity_size);
+			/* empty data column (small write), allocate skip sector */
 			rc->rc_abd = abd_get_zeros(skip_size);
 		}
 
-		uint64_t abd_size = abd_get_size(rc->rc_abd);
-		ASSERT3U(abd_size, ==, abd_get_size(rm->rm_col[0].rc_abd));
+		ASSERT3U(abd_get_size(rc->rc_abd), ==, parity_size);
 
 		abd_off += rc->rc_size;
-		rc->rc_size = abd_size;
+		rc->rc_size = parity_size;
 	}
-
+	ASSERT3U(abd_off, ==, zio->io_size);
 	rm->rm_cols = rm->rm_scols;
 }
 
@@ -126,7 +134,7 @@ vdev_draid_map_alloc_write(zio_t *zio, raidz_map_t *rm)
  * Scrub/resilver reads.  In order to store the contents of the skip sectors
  * an additional ABD is allocated.  The columns are handled in the same way
  * as a full stripe write except instead of using the zero ABD the newly
- * allocated skip ABD is used the back the skip sectors.  In all cases the
+ * allocated skip ABD is used to back the skip sectors.  In all cases the
  * data ABD must be the same size as the parity ABDs.
  *
  * Both the rm->rm_cols and rc->rc_size are increased to allow the parity
@@ -193,6 +201,61 @@ vdev_draid_map_alloc_read(zio_t *zio, raidz_map_t *rm)
 	}
 }
 
+static uint64_t
+vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff)
+{
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
+
+	/* The starting dRAID (parent) vdev sector of the block. */
+	const uint64_t ashift = vd->vdev_top->vdev_ashift;
+	const uint64_t b = loff >> ashift;
+
+	/* The zio's size in units of the vdev's minimum sector size. */
+	const uint64_t slice = DRAID_SLICESIZE >> ashift;
+
+	/*
+	 * We cycle through the disk permutations every SLICE * groupsz * ndisks
+	 * chunk of address space. This results in ndisks groups in each
+	 * permutation chunk (and guarantees alignment). So, for example,
+	 * if our slice size is 16MB, our group size is 10, and there are 13
+	 * data drives in the draid, then we will change permutation every
+	 * 2.08GB and each disk will have 150MB of data per chunk.
+	 */
+	uint64_t ndata = vdc->vdc_data;
+	uint64_t groupsz = ndata + vdc->vdc_parity;
+	uint64_t ndisks = vdc->vdc_children - vdc->vdc_spares;
+	uint64_t offset = b % (slice * ndisks * groupsz);
+	uint64_t group = b / (slice * groupsz);
+	uint64_t groupstart = (group * groupsz) % ndisks;
+
+	ASSERT3U(groupsz, >, 0);
+	ASSERT3U(groupstart + groupsz, <=, ndisks + groupstart);
+
+	/*
+	 * If there is less than groupsz drives available after the group
+	 * start, the group is going to wrap onto the next row. 'wrap' is the
+	 * group disk number that starts on the next row.
+	 */
+	uint64_t wrap = groupsz;
+	if (groupstart + groupsz > ndisks)
+		wrap = ndisks - groupstart;
+
+	/* now make offset a sector offset within a group chunk */
+	offset = offset % (slice * groupsz);
+	ASSERT0(offset % groupsz);
+
+	/*
+	 * Find the starting byte offset on each child vdev:
+	 * - each permutation covers a groupsz * slice portion of the disk
+	 * - within a permutation there are ndisks groups spread over groupsz
+	 *   rows, where each row covers a slice portion of the disk
+	 * - so we need to find the row where this IO group target begins
+	 */
+	uint64_t perm = group / ndisks;
+	uint64_t row = (perm * groupsz) + ((group % ndisks) * groupsz) / ndisks;
+	return (((slice * row) + (offset / groupsz)) << ashift);
+}
+
 /*
  * Allocate the raidz mapping to be applied to the dRAID I/O.  The parity
  * calculations for dRAID are identical to raidz.  The only caveat is that
@@ -214,32 +277,46 @@ vdev_draid_map_alloc(zio_t *zio)
 	const uint64_t slice = DRAID_SLICESIZE >> ashift;
 
 	/*
-	 * Figure out in which group the IO will fall and use it to set the
-	 * group start index, group size and number of data columns.  The
-	 * offset is converted to a sector offset within this group chunk.
+	 * We cycle through the disk permutations every SLICE * groupsz * ndisks
+	 * chunk of address space. This results in ndisks groups in each
+	 * permutation chunk (and guarantees alignment). So, for example,
+	 * if our slice size is 16MB, our group size is 10, and there are 13
+	 * data drives in the draid, then we will change permutation every
+	 * 2.08GB and each disk will have 150MB of data per chunk.
 	 */
-	uint64_t groupstart = 0;
-	uint64_t groupsz = 0;
-	uint64_t ndata = 0;
-	uint64_t offset = b % ((vdc->vdc_children - vdc->vdc_spares) * slice);
-
-	for (uint64_t group = 0; group < vdc->vdc_groups; group++) {
-		ndata = vdc->vdc_data[group];
-		groupsz = ndata + vdc->vdc_parity;
-		uint64_t span = groupsz * slice;
-		if (offset < span)
-			break;
-		offset -= span;
-		groupstart += groupsz;
-	}
+	uint64_t ndata = vdc->vdc_data;
+	uint64_t groupsz = ndata + vdc->vdc_parity;
+	uint64_t ndisks = vdc->vdc_children - vdc->vdc_spares;
+	uint64_t offset = b % (slice * ndisks * groupsz);
+	uint64_t group = b / (slice * groupsz);
+	uint64_t groupstart = (group * groupsz) % ndisks;
 
 	ASSERT3U(groupsz, >, 0);
-	ASSERT0(offset % groupsz);
-	ASSERT3U(groupstart + groupsz, <=, vdc->vdc_children - vdc->vdc_spares);
+	ASSERT3U(groupstart + groupsz, <=, ndisks + groupstart);
 
-	/* The starting byte offset on each child vdev. */
-	uint64_t perm = b / ((vdc->vdc_children - vdc->vdc_spares) * slice);
-	uint64_t o = (perm * slice + offset / groupsz) << ashift;
+	/*
+	 * If there is less than groupsz drives available after the group
+	 * start, the group is going to wrap onto the next row. 'wrap' is the
+	 * group disk number that starts on the next row.
+	 */
+	uint64_t wrap = groupsz;
+	if (groupstart + groupsz > ndisks)
+		wrap = ndisks - groupstart;
+
+	/* now make offset a sector offset within a group chunk */
+	offset = offset % (slice * groupsz);
+	ASSERT0(offset % groupsz);
+
+	/*
+	 * Find the starting byte offset on each child vdev:
+	 * - each permutation covers a groupsz * slice portion of the disk
+	 * - within a permutation there are ndisks groups spread over groupsz
+	 *   rows, where each row covers a slice portion of the disk
+	 * - so we need to find the row where this IO group target begins
+	 */
+	uint64_t perm = group / ndisks;
+	uint64_t row = (perm * groupsz) + ((group % ndisks) * groupsz) / ndisks;
+	uint64_t o = ((slice * row) + (offset / groupsz)) << ashift;
 
 	/*
 	 * "Quotient": The number of data sectors for this stripe on all but
@@ -280,7 +357,11 @@ vdev_draid_map_alloc(zio_t *zio)
 	uint64_t *base, iter, asize = 0;
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
 	for (uint64_t c = 0; c < groupsz; c++) {
-		uint64_t i = groupstart + c;
+		uint64_t i = (groupstart + c) % ndisks;
+
+		/* increment the offset if we wrap to the next row */
+		if (c == wrap)
+			o += slice << ashift;
 
 		rm->rm_col[c].rc_devidx =
 		    vdev_draid_permute_id(vdc, base, iter, i);
@@ -291,6 +372,14 @@ vdev_draid_map_alloc(zio_t *zio)
 		rm->rm_col[c].rc_tried = 0;
 		rm->rm_col[c].rc_skipped = 0;
 		rm->rm_col[c].rc_repair = 0;
+
+		/* resolve dspare to actual leaf child */
+		vdev_t *cvd = vd->vdev_child[rm->rm_col[c].rc_devidx];
+		if (cvd->vdev_ops == &vdev_draid_spare_ops) {
+			cvd = vdev_draid_spare_get_child(cvd, o);
+			ASSERT3P(cvd->vdev_parent, ==, vd);
+			rm->rm_col[c].rc_devidx = cvd->vdev_id;
+		}
 
 		if (c >= rm->rm_cols)
 			rm->rm_col[c].rc_size = 0;
@@ -305,10 +394,13 @@ vdev_draid_map_alloc(zio_t *zio)
 	ASSERT3U(asize, ==, tot << ashift);
 	rm->rm_asize = roundup(asize, groupsz << ashift);
 	rm->rm_nskip = roundup(tot, groupsz) - tot;
+	IMPLY(bc > 0, rm->rm_nskip == groupsz - bc);
 	ASSERT3U(rm->rm_asize - asize, ==, rm->rm_nskip << ashift);
 	ASSERT3U(rm->rm_nskip, <, ndata);
+	ASSERT3U((offset << ashift) + rm->rm_asize, <=, (slice * groupsz) << ashift);
 
 	/* Allocate buffers for the parity columns */
+	/* XXX - could we delay/avoid this on read until reconstruction? */
 	for (uint64_t c = 0; c < rm->rm_firstdatacol; c++) {
 		raidz_col_t *rc = &rm->rm_col[c];
 		rc->rc_abd = abd_alloc_linear(rc->rc_size, B_TRUE);
@@ -325,19 +417,27 @@ vdev_draid_map_alloc(zio_t *zio)
 	    (zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER))) {
 		vdev_draid_map_alloc_scrub(zio, rm);
 	} else {
+		ASSERT3U(zio->io_type, ==, ZIO_TYPE_READ);
 		vdev_draid_map_alloc_read(zio, rm);
 	}
 
 	rm->rm_ops = vdev_raidz_math_get_ops();
 	zio->io_vsd = rm;
 	zio->io_vsd_ops = &vdev_raidz_vsd_ops;
-
+#if 0
+#ifndef _KERNEL
+printf("map %llu %d ->", (u_longlong_t)zio->io_offset, (int)zio->io_size);
+for (int i = 0; i < rm->rm_scols; i++)
+	printf(" %d: <%llu,%d>", (int)rm->rm_col[i].rc_devidx, (u_longlong_t)rm->rm_col[i].rc_offset, (int)rm->rm_col[i].rc_size);
+printf("\n");
+#endif
+#endif
 	return (rm);
 }
 
 /*
  * Converts a dRAID read raidz_map_t to a dRAID scrub raidz_map_t.  The
- * key difference is that and ABD is allocated to back to skip sectors
+ * key difference is that an ABD is allocated to back up skip sectors
  * so they may be read, verified, and repaired if needed.
  */
 void
@@ -358,11 +458,14 @@ vdev_draid_map_include_skip_sectors(zio_t *zio)
 
 /*
  * Return the asize of a full dRAID slice across all child vdevs.
+ * Each disk has groupsz "rows" in a dRAID slice.
  */
 static inline uint64_t
 vdev_draid_permutation_asize(vdev_draid_config_t *vdc)
 {
-	return ((vdc->vdc_children - vdc->vdc_spares) << DRAID_SLICESHIFT);
+	uint64_t groupsz =
+	    (vdc->vdc_data + vdc->vdc_parity) << DRAID_SLICESHIFT;
+	return ((vdc->vdc_children - vdc->vdc_spares) * groupsz);
 }
 
 /*
@@ -371,26 +474,13 @@ vdev_draid_permutation_asize(vdev_draid_config_t *vdc)
 uint64_t
 vdev_draid_offset_to_group(const vdev_t *vd, uint64_t offset)
 {
-	uint64_t perm, perm_off, group;
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t nparity = vd->vdev_nparity;
-	uint64_t asize = vdev_draid_permutation_asize(vdc);
+	uint64_t groupsz = 
+	    (vdc->vdc_data + vd->vdev_nparity) << DRAID_SLICESHIFT;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	perm = offset / asize;
-	perm_off = offset % asize;
-
-	for (group = 0; group < vdc->vdc_groups; group++) {
-		uint64_t ndata = vdc->vdc_data[group];
-		uint64_t group_size = (ndata + nparity) << DRAID_SLICESHIFT;
-		if (perm_off < group_size)
-			break;
-		perm_off -= group_size;
-	}
-	ASSERT3U(group, <, vdc->vdc_groups);
-
-	return (perm * vdc->vdc_groups + group);
+	return (offset / groupsz);
 }
 
 /*
@@ -403,53 +493,23 @@ vdev_draid_group_to_offset(const vdev_t *vd, uint64_t group)
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	uint64_t nparity = vd->vdev_nparity;
-	uint64_t offset = vdev_draid_permutation_asize(vdc) *
-	    (group / vdc->vdc_groups);
-
-	for (uint64_t i = 0; i < group % vdc->vdc_groups; i++) {
-		uint64_t ndata = vdc->vdc_data[i];
-		offset += (ndata + nparity) << DRAID_SLICESHIFT;
-	}
-
-	return (offset);
+	uint64_t groupsz = 
+	    (vdc->vdc_data + vd->vdev_nparity) << DRAID_SLICESHIFT;
+	return (group * groupsz);
 }
 
 /*
- * Given a starting offset compute the next properly aligned offset.
- * This involves finding the appropriate permutation chunk and then
- * computing which group in that chunk the offset falls. Once this
- * is calculated, the offset must be aligned to a slice boundary within
- * the raid group.
+ * Given a offset into a draid, compute a group aligned offset.
  */
 uint64_t
 vdev_draid_get_astart(const vdev_t *vd, const uint64_t start)
 {
-	uint64_t astart, perm_off, groupsz, group_chunk;
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
+	uint64_t align = (vdc->vdc_data + vd->vdev_nparity) << vd->vdev_ashift;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	perm_off = start % vdev_draid_permutation_asize(vdc);
-	groupsz = 0;
-	group_chunk = 0;
-
-	for (int i = 0; i < vdc->vdc_groups; i++) {
-		groupsz = vdc->vdc_data[i] + vd->vdev_nparity;
-		group_chunk = groupsz << DRAID_SLICESHIFT;
-		if (perm_off < group_chunk)
-			break;
-		perm_off -= group_chunk;
-	}
-
-	ASSERT3U(perm_off, <, group_chunk);
-	ASSERT3U(groupsz, <=, vdc->vdc_children - vdc->vdc_spares);
-
-	astart = start - perm_off;
-	astart += roundup(perm_off, groupsz << vd->vdev_ashift);
-	ASSERT3U(astart, >=, start);
-
-	return (astart);
+	return (roundup(start, align));
 }
 
 /*
@@ -462,7 +522,7 @@ uint64_t
 vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
 {
 	uint64_t group = vdev_draid_offset_to_group(vd, start);
-	uint64_t asize = vdev_draid_asize_by_type(vd, start, *asizep);
+	uint64_t asize = vdev_draid_psize_to_asize(vd, start, *asizep);
 	uint64_t end = start + asize - 1;
 
 	/* An allocation may not span metaslabs. */
@@ -479,7 +539,7 @@ vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
 	/* Advance to the next group. */
 	group++;
 	start = vdev_draid_group_to_offset(vd, group);
-	asize = vdev_draid_asize_by_type(vd, start, *asizep);
+	asize = vdev_draid_psize_to_asize(vd, start, *asizep);
 	end = start + asize - 1;
 
 	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, end));
@@ -547,7 +607,7 @@ vdev_draid_readable(vdev_t *vd, uint64_t offset)
 }
 
 /*
- * Returns B_TRUE if the guid exists in the vdev tree.
+ * Returns B_TRUE if the guid exists in the vdev tree rooted at 'vd'.
  */
 static boolean_t
 vdev_draid_guid_exists(vdev_t *vd, uint64_t guid, uint64_t offset)
@@ -558,11 +618,8 @@ vdev_draid_guid_exists(vdev_t *vd, uint64_t guid, uint64_t offset)
 			return (B_FALSE);
 	}
 
-	if (vd->vdev_guid == guid)
-		return (B_TRUE);
-
 	if (vd->vdev_ops->vdev_op_leaf)
-		return (B_FALSE);
+		return (vd->vdev_guid == guid);
 
 	for (int c = 0; c < vd->vdev_children; c++)
 		if (vdev_draid_guid_exists(vd->vdev_child[c], guid, offset))
@@ -614,18 +671,23 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	uint64_t *base, iter;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
-	ASSERT3U(vdev_draid_offset_to_group(vd, offset), ==,
+
+	uint64_t group = vdev_draid_offset_to_group(vd, offset);
+	ASSERT3U(group, ==,
 	    vdev_draid_offset_to_group(vd, offset + size - 1));
 
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t pindex = offset /
-	    ((vdc->vdc_children - vdc->vdc_spares) * DRAID_SLICESIZE);
-	vdev_draid_get_perm(vdc, pindex, &base, &iter);
+	uint64_t perm = group / vdc->vdc_groups;
+	vdev_draid_get_perm(vdc, perm, &base, &iter);
 
-	uint64_t ncols = vdc->vdc_children;
-	uint64_t coff = (offset / ((ncols - vdc->vdc_spares)
-	    << DRAID_SLICESHIFT)) << DRAID_SLICESHIFT;
-	for (int c = 0; c < ncols; c++) {
+	/*
+	 * For the purposes of vdev_draid_vd_degraded(), we need to
+	 * find the disk offset for the permutation slice in order to
+	 * determine the mapping of distributed spare drives.
+	 */
+	uint64_t groupsz = vdc->vdc_data + vdc->vdc_parity;
+	uint64_t coff = perm * (groupsz << DRAID_SLICESHIFT);
+	for (int c = 0; c < vdc->vdc_children; c++) {
 		uint64_t cid = vdev_draid_permute_id(vdc, base, iter, c);
 		vdev_t *cvd = vd->vdev_child[cid];
 
@@ -662,8 +724,6 @@ vdev_draid_config_create(vdev_t *vd)
 {
 	uint_t c;
 	uint8_t *perms = NULL;
-	uint8_t *data = NULL;
-	uint64_t *ndata = NULL;
 	nvlist_t *nvl = vd->vdev_cfg;
 
 	if (vdev_draid_config_validate(nvl, 0, vd->vdev_nparity, 0,
@@ -676,18 +736,13 @@ vdev_draid_config_create(vdev_t *vd)
 	    ZPOOL_CONFIG_DRAIDCFG_CHILDREN);
 	vdc->vdc_groups = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_GROUPS);
+	vdc->vdc_data = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_DATA);
 	vdc->vdc_parity = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_PARITY);
 	vdc->vdc_spares = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_SPARES);
 	vdc->vdc_bases = fnvlist_lookup_uint64(nvl, ZPOOL_CONFIG_DRAIDCFG_BASE);
-
-	VERIFY0(nvlist_lookup_uint8_array(nvl,
-	    ZPOOL_CONFIG_DRAIDCFG_DATA, &data, &c));
-	ndata = kmem_alloc(sizeof (uint64_t) * vdc->vdc_groups, KM_SLEEP);
-	for (int i = 0; i < vdc->vdc_groups; i++)
-		ndata[i] = data[i];
-	vdc->vdc_data = ndata;
 
 	VERIFY0(nvlist_lookup_uint8_array(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_PERM, &perms, &c));
@@ -842,24 +897,22 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 	return (0);
 }
 
+/*
+ * dRAID asize is psize rounded up to a full group stripe multiple
+ * plus parity.
+ */
 static uint64_t
-vdev_draid_asize_by_type(const vdev_t *vd, uint64_t offset, uint64_t psize)
+vdev_draid_psize_to_asize(const vdev_t *vd, uint64_t offset, uint64_t psize)
 {
-	uint64_t group;
-	uint64_t asize;
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
 	uint64_t nparity = vd->vdev_nparity;
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
-
-	group = vdev_draid_offset_to_group(vd, offset);
-	group = group % vdc->vdc_groups;
+	uint64_t asize = ((psize - 1) >> ashift) + 1;
+	uint64_t ndata = vdc->vdc_data;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
-
-	asize = ((psize - 1) >> ashift) + 1;
-
-	uint64_t ndata = vdc->vdc_data[group];
 	ASSERT3U(ndata, !=, 0);
+
 	asize = roundup(asize, ndata);
 	asize += nparity * (asize / ndata);
 
@@ -869,66 +922,23 @@ vdev_draid_asize_by_type(const vdev_t *vd, uint64_t offset, uint64_t psize)
 	return (asize << ashift);
 }
 
-/*
- * Calculate the inflated asize for the specified offset and psize.  It's
- * possible to pass -1 for the offset when it's unknown by the caller.  In
- * this case we can't compute a precise asize, but we can return an over-
- * estimated value for the size and correct it later at allocation.
- */
 static uint64_t
 vdev_draid_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
 {
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t last = vdc->vdc_groups - 1;
-	uint64_t ndata = vdc->vdc_data[0];
-	uint64_t nparity = vdc->vdc_parity;
-	uint64_t asizef = ((psize - 1) >> vd->vdev_top->vdev_ashift) + 1;
-	uint64_t asizel = ((psize - 1) >> vd->vdev_top->vdev_ashift) + 1;
-
-	if (offset != -1)
-		return (vdev_draid_asize_by_type(vd, offset, psize));
-
-	/* Compute asize using first group size */
-	asizef = roundup(asizef, ndata);
-	asizef += nparity * (asizef / ndata);
-	ASSERT0(asizef % (nparity + ndata));
-
-	/* Compute asize using last group size */
-	ndata = vdc->vdc_data[last];
-	asizel = roundup(asizel, ndata);
-	asizel += nparity * (asizel / ndata);
-	ASSERT0(asizel % (nparity + ndata));
-
-	/* Return larger of the two sizes computed */
-	if (asizef > asizel)
-		return (asizef << vd->vdev_top->vdev_ashift);
-	else
-		return (asizel << vd->vdev_top->vdev_ashift);
+	return (vdev_draid_psize_to_asize(vd, offset, psize));
 }
 
 /*
  * Deflate the asize to the psize for a block at the provided offset.
+ * This involves stripping parity.
  */
 uint64_t
 vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t ashift __maybe_unused = vd->vdev_top->vdev_ashift;
-	uint64_t psize, ndata;
-	uint64_t group = vdev_draid_offset_to_group(vd, offset);
+	uint64_t dataplusparity = vdc->vdc_data + vd->vdev_nparity;
 
-	ASSERT0(P2PHASE(asize, 1ULL << ashift));
-	ASSERT0(P2PHASE(offset, 1ULL << ashift));
-
-	group = group % vdc->vdc_groups;
-	ndata = vdc->vdc_data[group];
-
-	ASSERT0((asize >> ashift) % (ndata + vd->vdev_nparity));
-	psize = (asize / (ndata + vd->vdev_nparity)) * ndata;
-
-	ASSERT3U(psize, <=, spa_maxblocksize(vd->vdev_spa));
-
-	return (psize);
+	return ((asize / dataplusparity) * vdc->vdc_data);
 }
 
 /*
@@ -939,7 +949,7 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t group = vdev_draid_offset_to_group(vd, offset);
+	uint64_t ndata = vdc->vdc_data;
 
 	/*
 	 * When the maxpsize >> ashift does not divide evenly by the number
@@ -947,13 +957,12 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 	 * sectors will cause vdev_draid_asize_to_psize() to get a psize larger
 	 * than the maximum allowed block size.
 	 */
-	group = group % vdc->vdc_groups;
 	maxpsize >>= ashift;
-	maxpsize /= vdc->vdc_data[group];
-	maxpsize *= vdc->vdc_data[group];
+	maxpsize /= ndata;
+	maxpsize *= ndata;
 	maxpsize <<= ashift;
 
-	return (vdev_draid_asize_by_type(vd, offset, maxpsize));
+	return (vdev_draid_psize_to_asize(vd, offset, maxpsize));
 }
 
 /*
@@ -1072,7 +1081,7 @@ vdev_draid_io_start(zio_t *zio)
 
 	ASSERT(zio->io_type == ZIO_TYPE_READ);
 
-	/* Scrub/resilver must verify skip sectors, expanded raidz map */
+	/* Scrub/resilver must verify skip sectors => expanded raidz map */
 	IMPLY(zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER),
 	    rm->rm_cols == rm->rm_scols);
 
@@ -1082,8 +1091,8 @@ vdev_draid_io_start(zio_t *zio)
 	/*
 	 * Iterate over the columns in reverse order so that we hit the parity
 	 * last.  Any errors along the way will force us to read the parity.
-	 * For scrub/resilver IOs which verify skip sectors a gang ABD will
-	 * have been allocated to store them and rc->rc_size_increased.
+	 * For scrub/resilver IOs which verify skip sectors, a gang ABD will
+	 * have been allocated to store them and rc->rc_size is increased.
 	 */
 	for (int c = rm->rm_cols - 1; c >= 0; c--) {
 		raidz_col_t *rc = &rm->rm_col[c];
@@ -1165,7 +1174,6 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 	uint64_t ashift = raidvd->vdev_top->vdev_ashift;
 	uint64_t children = vdc->vdc_children;
 	uint64_t spares = vdc->vdc_spares;
-	uint64_t b_slicesz = DRAID_SLICESIZE >> ashift;
 
 	/* Make sure the offsets are block-aligned */
 	ASSERT0(in->rs_start % (1 << ashift));
@@ -1176,10 +1184,10 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 
 	/*
 	 * Translation requests can never span three or more slices.  Doing so
-	 * would result in distributed spare space being incorrectly included
+	 * could result in distributed spare space being incorrectly included
 	 * in the physical range.  Therefore, vdev_xlate() limits the input
 	 * size to a single group.  This is stricter than absolutely necessary
-	 * but only needing to check one group helps simplify the logic below.
+	 * but helps simplify the logic below.
 	 */
 	ASSERT3U(vdev_draid_offset_to_group(raidvd, in->rs_start), ==,
 	    vdev_draid_offset_to_group(raidvd, in->rs_end - 1));
@@ -1188,29 +1196,24 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 	 * Figure out in which group the IO will fall and use it to set the
 	 * group start index, size, and number of columns.
 	 */
-	uint64_t b_offset = b_start % ((children - spares) * b_slicesz);
-	uint64_t b_groupsz = 0;
-	uint64_t groupstart = 0;
-	uint64_t width = 0;
-
-	for (uint64_t group = 0; group < vdc->vdc_groups; group++) {
-		width = vdc->vdc_data[group] + vdc->vdc_parity;
-		b_groupsz = width * b_slicesz;
-		if (b_offset < b_groupsz)
-			break;
-		b_offset -= b_groupsz;
-		groupstart += width;
-	}
+	uint64_t width = vdc->vdc_data + vdc->vdc_parity;
+	uint64_t groupsz = width * (DRAID_SLICESIZE >> ashift);
+	uint64_t group = b_start / groupsz;
+	uint64_t groupstart = (group * width) % (children - spares);
 
 	ASSERT3U(vdc->vdc_groups, >, 0);
-	ASSERT3U(b_groupsz, >, 0);
-	ASSERT0(b_offset % width);
-	ASSERT3U(groupstart + width, <=, children - spares);
+	ASSERT3U(groupsz, >, 0);
 
 	/* Set the starting row for the permutation group. */
-	uint64_t perm = b_start / ((children - spares) * b_slicesz);
-	uint64_t start_row = perm * b_slicesz;
-	uint64_t end_row = perm * b_slicesz;
+	uint64_t perm = group / (children - spares);
+	uint64_t start_row = (perm * width) +
+	    ((group % (children - spares)) * width) / (children - spares);
+	uint64_t end_row = start_row;
+	uint64_t b_offset = b_start % groupsz;
+	uint64_t start = vdev_draid_logical_to_physical(raidvd, in->rs_start);
+	uint64_t end = start;
+
+	ASSERT0(b_offset % width);
 
 	uint64_t *base, iter, id;
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
@@ -1219,24 +1222,39 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 	 * Check if the passed child falls within the group.  If it does
 	 * update the start_row and end_row to reflect the physical range.
 	 * Otherwise, leave them unmodified which will result in an empty
-	 * zero-length physical range being returned.
+	 * (zero-length) physical range being returned.
 	 */
 	for (uint64_t i = 0; i < width; i++) {
-		id = vdev_draid_permute_id(vdc, base, iter, groupstart + i);
-		if (id == cvd->vdev_id) {
-			if (b_offset > i)
-				start_row += ((b_offset - i - 1) / width) + 1;
+		uint64_t c = (groupstart + i) % (children - spares);
 
-			if (b_offset + b_size > i) {
-				end_row += ((b_offset + b_size - i - 1) /
-				    width) + 1;
+		if (c == 0 && i != 0) {
+			/* the group wrapped, increment the start row */
+			start_row += 1;
+			end_row += 1;
+			start += DRAID_SLICESIZE;
+			end = start;
+		}
+		id = vdev_draid_permute_id(vdc, base, iter, c);
+		if (id == cvd->vdev_id) {
+			if (b_offset > 0) {
+				ASSERT3U(b_offset, >, i);
+				/* XXX - this seems wrong. Why is 'i' involved?
+				start_row += ((b_offset - i - 1) / width) + 1;
+				*/
+				start_row += ((b_offset - 1) / width) + 1;
 			}
+			ASSERT3U(b_size, >, 0);
+			end_row += ((b_offset + b_size - 1) / width) + 1;
+			end = start + ((b_size / width) << ashift);
 			break;
 		}
 	}
-
+/*
 	res->rs_start = start_row << ashift;
 	res->rs_end = end_row << ashift;
+*/
+	res->rs_start = start;
+	res->rs_end = end;
 
 	ASSERT3U(res->rs_start, <=, in->rs_start);
 	ASSERT3U(res->rs_end - res->rs_start, <=, in->rs_end - in->rs_start);
@@ -1317,9 +1335,10 @@ vdev_draid_spare_is_active(vdev_t *vd)
 }
 
 /*
- * Expects a dRAID distribute spare vdev and returns the physical child vdev
+ * Given a dRAID distribute spare vdev, returns the physical child vdev
  * on which the provided offset resides.  This may involve recursing through
  * multiple layers of distributed spares.
+ * Note that offset is relative to this vdev.
  */
 static vdev_t *
 vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
@@ -1341,7 +1360,10 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
 
 	uint64_t *base, iter;
-	vdev_draid_get_perm(vdc, offset >> DRAID_SLICESHIFT, &base, &iter);
+	uint64_t slicesz =
+	    (vdc->vdc_data + vdc->vdc_parity) << DRAID_SLICESHIFT;
+	uint64_t perm = offset / slicesz;
+	vdev_draid_get_perm(vdc, perm, &base, &iter);
 	uint64_t cid = vdev_draid_permute_id(vdc, base, iter,
 	    (tvd->vdev_children - 1) - vds->vds_spare_id);
 	vdev_t *cvd = tvd->vdev_child[cid];
@@ -1352,6 +1374,11 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 	return (cvd);
 }
 
+#if 0
+#ifndef _KERNEL
+#include <execinfo.h>
+#endif
+#endif
 /*
  * Close a dRAID spare device.
  */
@@ -1360,6 +1387,14 @@ vdev_draid_spare_close(vdev_t *vd)
 {
 	vdev_draid_spare_t *vds = vd->vdev_tsd;
 
+#if 0
+#ifndef _KERNEL
+printf("Entering close %s: %p %d\n", vd->vdev_path, vd->vdev_tsd, vd->vdev_reopening);
+void *buffer[100];
+int nptrs = backtrace(buffer, 100);
+backtrace_symbols_fd(buffer, nptrs, 1);
+#endif
+#endif
 	if (vd->vdev_reopening || vds == NULL)
 		return;
 
@@ -1409,7 +1444,7 @@ vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 		return (SET_ERROR(EINVAL));
 
 	/* Spare name dRAID settings agree with top-level dRAID vdev */
-	if (vdc->vdc_parity != parity || vdc->vdc_groups != groups ||
+	if (vdc->vdc_parity != parity ||
 	    vdc->vdc_spares != spares || vdc->vdc_spares <= spare_id) {
 		return (SET_ERROR(EINVAL));
 	}

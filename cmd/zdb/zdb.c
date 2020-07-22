@@ -5178,8 +5178,6 @@ zdb_blkptr_done(zio_t *zio)
 	zdb_cb_t *zcb = zio->io_private;
 	zbookmark_phys_t *zb = &zio->io_bookmark;
 
-	abd_free(zio->io_abd);
-
 	mutex_enter(&spa->spa_scrub_lock);
 	spa->spa_load_verify_bytes -= BP_GET_PSIZE(bp);
 	cv_broadcast(&spa->spa_scrub_io_cv);
@@ -5204,8 +5202,11 @@ zdb_blkptr_done(zio_t *zio)
 		    (u_longlong_t)zb->zb_level,
 		    (u_longlong_t)zb->zb_blkid,
 		    blkbuf);
+ASSERT(ioerr != ECKSUM);
 	}
 	mutex_exit(&spa->spa_scrub_lock);
+
+	abd_free(zio->io_abd);
 }
 
 static int

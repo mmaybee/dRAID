@@ -44,9 +44,8 @@ vdev_draid_config_validate(nvlist_t *config,
     uint64_t required_spares, uint64_t required_children)
 {
 	uint_t c;
-	uint8_t *data = NULL;
 	uint8_t *perm = NULL;
-	uint64_t n, g, p, s, b;
+	uint64_t n, g, d, p, s, b;
 
 	/* Validate configuration children exists and are within range. */
 	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_CHILDREN, &n))
@@ -58,7 +57,7 @@ vdev_draid_config_validate(nvlist_t *config,
 	if (required_children != 0 && n != required_children)
 		return (DRAIDCFG_ERR_CHILDREN_MISMATCH);
 
-	/* Validate configuration parity exists and are within range. */
+	/* Validate configuration parity exists and is within range. */
 	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_PARITY, &p))
 		return (DRAIDCFG_ERR_PARITY_MISSING);
 
@@ -68,6 +67,23 @@ vdev_draid_config_validate(nvlist_t *config,
 	if (required_parity != 0 && p != required_parity)
 		return (DRAIDCFG_ERR_PARITY_MISMATCH);
 
+	/* Validate group data size exists and is within range. */
+	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_DATA, &d))
+		return (DRAIDCFG_ERR_DATA_MISSING);
+
+	if (d == 0 || (d + p) > VDEV_DRAID_MAX_GROUPSIZE)
+		return (DRAIDCFG_ERR_DATA_INVALID);
+
+	/* Validate configuration spares exists and are within range. */
+	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_SPARES, &s))
+		return (DRAIDCFG_ERR_SPARES_MISSING);
+
+	if (s == 0 || s > VDEV_DRAID_MAX_SPARES || s > (n - (d + p)))
+		return (DRAIDCFG_ERR_SPARES_INVALID);
+
+	if (required_spares != 0 && s != required_spares)
+		return (DRAIDCFG_ERR_SPARES_MISMATCH);
+
 	/* Validate configuration groups exists and are within range. */
 	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_GROUPS, &g))
 		return (DRAIDCFG_ERR_GROUPS_MISSING);
@@ -75,44 +91,8 @@ vdev_draid_config_validate(nvlist_t *config,
 	if (g == 0 || g > VDEV_DRAID_MAX_GROUPS)
 		return (DRAIDCFG_ERR_GROUPS_INVALID);
 
-	if (required_groups != 0 && g != required_groups)
+	if (g != n - s)
 		return (DRAIDCFG_ERR_GROUPS_MISMATCH);
-
-	/* Validate configuration spares exists and are within range. */
-	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_SPARES, &s))
-		return (DRAIDCFG_ERR_SPARES_MISSING);
-
-	if (s == 0 || s > VDEV_DRAID_MAX_SPARES || s > (n - (g * (p + 1))))
-		return (DRAIDCFG_ERR_SPARES_INVALID);
-
-	if (required_spares != 0 && s != required_spares)
-		return (DRAIDCFG_ERR_SPARES_MISMATCH);
-
-	/*
-	 * Validate configuration data array exists and that the array size
-	 * matches the expected number of groups.  Furthermore, verify the
-	 * number of devices in each group is below average (plus one) to
-	 * confirm the group sizes are approximately equal in size.
-	 */
-	if (nvlist_lookup_uint8_array(config,
-	    ZPOOL_CONFIG_DRAIDCFG_DATA, &data, &c)) {
-		return (DRAIDCFG_ERR_DATA_MISSING);
-	}
-
-	if (c != g)
-		return (DRAIDCFG_ERR_DATA_MISMATCH);
-
-	uint64_t total_d_p = 0;
-	uint64_t max = (n - s) / g + 1;
-
-	for (uint64_t i = 0; i < g; i++) {
-		uint64_t val = data[i] + p;
-
-		if (val > max)
-			return (DRAIDCFG_ERR_DATA_INVALID);
-
-		total_d_p += val;
-	}
 
 	/* Validate configuration base exists and is within range. */
 	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_BASE, &b))
@@ -125,7 +105,7 @@ vdev_draid_config_validate(nvlist_t *config,
 	 * Validate the minimum number of children exist per group for the
 	 * specified parity level (draid1 >= 3, draid2 >= 4, draid3 >= 5).
 	 */
-	if (n < ((g * (1 + p)) + s))
+	if (n < (d + p + s))
 		return (DRAIDCFG_ERR_CHILDREN_INVALID);
 
 	/*
@@ -133,7 +113,7 @@ vdev_draid_config_validate(nvlist_t *config,
 	 * of distributed spares equals the number of data and parity devices.
 	 * This is a hard constraint of the distribution parity implementation.
 	 */
-	if ((n - s) != total_d_p)
+	if ((n - s) * (d + p) != (g * (d + p)))
 		return (DRAIDCFG_ERR_LAYOUT);
 
 	if (nvlist_lookup_uint8_array(config,
@@ -990,26 +970,17 @@ find_known_config(uint64_t groups, uint64_t parity, uint64_t spares,
 }
 
 static vdev_draid_config_t *
-create_config(uint64_t groups, uint64_t parity, uint64_t spares,
+create_config(uint64_t data, uint64_t parity, uint64_t spares,
     uint64_t children, int passes, draidcfg_eval_t eval, int faults)
 {
 	vdev_draid_config_t *vdc;
-	uint64_t *array, data, extra;
+
+	ASSERT(data != 0);
+	ASSERT3U(data + parity, <, children - spares);
 
 	vdc = kmem_zalloc(sizeof (vdev_draid_config_t), KM_SLEEP);
-	vdc->vdc_groups = groups;
-
-	array = kmem_zalloc(groups * sizeof (uint64_t), KM_SLEEP);
-	data = (children - spares) / groups - parity;
-	extra = (children - spares) % groups;
-
-	for (int i = 0; i < groups; i++) {
-		array[i] = data;
-		if (i < extra)
-			array[i] += 1;
-	}
-
-	vdc->vdc_data = array;
+	vdc->vdc_groups = children - spares;
+	vdc->vdc_data = data;
 	vdc->vdc_parity = parity;
 	vdc->vdc_spares = spares;
 	vdc->vdc_children = children;
@@ -1017,7 +988,6 @@ create_config(uint64_t groups, uint64_t parity, uint64_t spares,
 	vdc->vdc_bases = 0;
 	vdc->vdc_base_perms = NULL;
 	if (draid_permutation_generate(vdc, passes, eval, faults) != 0) {
-		kmem_free(array, groups * sizeof (uint64_t));
 		kmem_free(vdc, sizeof (vdev_draid_config_t));
 		return (NULL);
 	}
@@ -1031,7 +1001,6 @@ create_config(uint64_t groups, uint64_t parity, uint64_t spares,
 static void
 free_config(vdev_draid_config_t *vdc)
 {
-	kmem_free((void *)vdc->vdc_data, vdc->vdc_groups * sizeof (uint64_t));
 	kmem_free((void *)vdc->vdc_base_perms,
 	    sizeof (uint64_t) * vdc->vdc_bases + vdc->vdc_children);
 	kmem_free(vdc, sizeof (*vdc));
@@ -1042,25 +1011,17 @@ free_config(vdev_draid_config_t *vdc)
  * The caller is responsible for freeing the new dRAID configuration.
  *
  * Inputs:
- * - groups:   number of redundancy groups (1-128)
+ * - data:     number of data blocks per group (1-32)
  * - parity:   number of parity blocks per group (1-3)
  * - spares:   number of distributed spare (1-100)
  * - children: total number of devices (1-255)
- * - data:     number of data blocks per group (1-32) [Optional]
  *
- * Valid values must be specified for the groups, parity, spares and
- * children arguments.  The data argument is optional.
+ * Valid values must be specified for the data, parity, spares and
+ * children arguments.
  *
- * When the data argument is specified evenly sized groups are assumed
- * and the following expression must be satisfied.  Otherwise, a valid
- * dRAID configuration cannot be generated.
- *
- *   (children - spares) % ((parity + data) * groups) == 0
- *
- * When data is unspecified then slightly uneven groups will be used in
- * order to generate a valid dRAID configuration.  This slight imbalance
- * allows for an arbitrary number of devices to be used which maximizes
- * capacity with minimal impact to performance.
+ * A dRAID configuration is derived by creating slices made up of
+ * (children - spares) groups (each group has data + parity logical
+ * drives).
  */
 draidcfg_err_t
 vdev_draid_config_generate(uint64_t groups, uint64_t data, uint64_t parity,
@@ -1071,15 +1032,19 @@ vdev_draid_config_generate(uint64_t groups, uint64_t data, uint64_t parity,
 	uint8_t *value;
 	nvlist_t *cfg;
 
+	if (data == 0 && groups > 0)
+		data = ((children - spares) / groups) - parity;
+
+	if (data > 0)
+		groups = children - spares;
+
 	if (groups == 0 || groups > VDEV_DRAID_MAX_GROUPS)
 		return (DRAIDCFG_ERR_GROUPS_INVALID);
 
 	/*
-	 * Verify the maximum allow group size is never exceeded given
-	 * the provided groups and children constraints.
+	 * Verify the maximum allow group size is never exceeded.
 	 */
-	if ((data != 0 && (data + parity > VDEV_DRAID_MAX_GROUPSIZE)) ||
-	    (data == 0 && (children / groups > VDEV_DRAID_MAX_GROUPSIZE))) {
+	if (data == 0 || (data + parity > VDEV_DRAID_MAX_GROUPSIZE)) {
 		return (DRAIDCFG_ERR_DATA_INVALID);
 	}
 
@@ -1087,20 +1052,18 @@ vdev_draid_config_generate(uint64_t groups, uint64_t data, uint64_t parity,
 		return (DRAIDCFG_ERR_PARITY_INVALID);
 
 	/*
-	 * Given the number of groups and parity requirements verify
-	 * the requested number of spares can be satisfied.
+	 * Verify the requested number of spares can be satisfied.
 	 */
 	if (spares == 0 || spares > VDEV_DRAID_MAX_SPARES ||
-	    spares > (children - (groups * (parity + 1)))) {
+	    spares > (children - (data + parity))) {
 		return (DRAIDCFG_ERR_SPARES_INVALID);
 	}
 
 	/*
-	 * Given the number of groups and parity requirements verify
-	 * the requested number children is sufficient.
+	 * Verify the requested number children is sufficient.
 	 */
 	if (children == 0 || children > VDEV_DRAID_MAX_CHILDREN ||
-	    children < ((groups * (1 + parity)) + spares)) {
+	    children < (data + parity + spares)) {
 		return (DRAIDCFG_ERR_CHILDREN_INVALID);
 	}
 
@@ -1108,12 +1071,9 @@ vdev_draid_config_generate(uint64_t groups, uint64_t data, uint64_t parity,
 		passes = DRAIDCFG_DEFAULT_PASSES;
 
 	/*
-	 * When data has been specified verify the dRAID configuration
-	 * constraints have been satisfied.  Otherwise, allow uneven
-	 * groups so a valid configuration can be generated.
+	 * Verify the dRAID configuration constraints have been satisfied.
 	 */
-	if (data != 0 &&
-	    ((children - spares) % ((parity + data) * groups)) != 0) {
+	if (groups != children - spares) {
 		return (DRAIDCFG_ERR_LAYOUT);
 	}
 
@@ -1142,22 +1102,16 @@ vdev_draid_config_generate(uint64_t groups, uint64_t data, uint64_t parity,
 	}
 
 	/* Generate configuration, should not fail after this point */
-	vdc = create_config(groups, parity, spares, children, passes,
+	vdc = create_config(data, parity, spares, children, passes,
 	    eval, faults);
 	if (vdc == NULL)
 		return (DRAIDCFG_ERR_INTERNAL);
 
 	cfg = fnvlist_alloc();
 
-	/* Store the number groups followed by an array of their sizes */
+	/* Store the number groups followed by their size */
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_GROUPS, groups);
-	value = kmem_zalloc(groups * sizeof (uint8_t), KM_SLEEP);
-	for (int i = 0; i < groups; i++) {
-		ASSERT3U(vdc->vdc_data[i], <=, VDEV_DRAID_MAX_CHILDREN);
-		value[i] = (uint8_t)vdc->vdc_data[i];
-	}
-	fnvlist_add_uint8_array(cfg, ZPOOL_CONFIG_DRAIDCFG_DATA, value, groups);
-	kmem_free(value, groups * sizeof (uint8_t));
+	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_DATA, data);
 
 	/* Store guid, seed, parity, spares, and children */
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_GUID, vdc->vdc_guid);

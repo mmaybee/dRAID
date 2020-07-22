@@ -195,8 +195,8 @@ setup_faulted_guids(vdev_rebuild_t *vr)
 		 * For the purposes of the dRAID rebuild a vdev is considered
 		 * to be faulted if it is a child of either a replacing or
 		 * sparing vdev type.  Tracking these vdevs allows the dRAID
-		 * rebuild to skip regions of the space map where are not
-		 * degraded due to the fault and do not need to be rebuilt.
+		 * rebuild to skip regions of the space map which are not
+		 * degraded due to the fault and so do not need to be rebuilt.
 		 */
 		if (add_faulted_guids(vr, tvd) != 0)
 			vr->vr_rebuild_all = B_TRUE;
@@ -633,8 +633,8 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	vr->vr_rebuild_phys.vrp_bytes_scanned += size;
 
 	/*
-	 * There's no need to issue a rebuild I/O for this range because
-	 * it does not overlap with a degraded dRAID group.
+	 * There's no need to issue a rebuild I/O for this range if
+	 * it does not fall in a degraded dRAID group.
 	 */
 	if (vd->vdev_ops == &vdev_draid_ops &&
 	    !draid_group_degraded(vr, start, size)) {
@@ -657,8 +657,8 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	spa_config_enter(spa, SCL_STATE_ALL, vd, RW_READER);
 	mutex_enter(&vd->vdev_rebuild_lock);
 
-	/* This is the first I/O for this txg. */
 	if (vr->vr_scan_offset[txg & TXG_MASK] == 0) {
+		/* This is the first I/O for this txg. */
 		vr->vr_scan_offset[txg & TXG_MASK] = start;
 		dsl_sync_task_nowait(spa_get_dsl(spa),
 		    vdev_rebuild_update_sync,
@@ -711,6 +711,7 @@ vdev_rebuild_chunk_size(vdev_t *vd, uint64_t start, uint64_t size)
 
 		group = vdev_draid_offset_to_group(vd, start);
 		left = vdev_draid_group_to_offset(vd, group + 1) - start;
+		/* chunk cannot span groups */
 		chunk_size = MIN(chunk_size, left);
 		ASSERT3U(vdev_draid_offset_to_group(vd, start), ==,
 		    vdev_draid_offset_to_group(vd, start + chunk_size - 1));
@@ -924,7 +925,7 @@ vdev_rebuild_thread(void *arg)
 
 		/*
 		 * When a metaslab has been allocated from read its allocated
-		 * ranges from the space map object in to the vr_scan_tree.
+		 * ranges from the space map object into the vr_scan_tree.
 		 * Then add inflight / unflushed ranges and remove inflight /
 		 * unflushed frees.  This is the minimum range to be rebuilt.
 		 */
@@ -957,7 +958,7 @@ vdev_rebuild_thread(void *arg)
 		/*
 		 * To provide an accurate estimate re-calculate the estimated
 		 * size every 5 minutes to account for recent allocations and
-		 * frees made space maps which have not yet been rebuilt.
+		 * frees made to space maps which have not yet been rebuilt.
 		 */
 		if (gethrtime() > update_est_time + SEC2NSEC(300)) {
 			update_est_time = gethrtime();
