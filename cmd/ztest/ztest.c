@@ -6139,7 +6139,7 @@ out:
 /*
  * By design ztest will never inject uncorrectable damage in to the pool.
  * Issue a scrub, wait for it to complete, and verify there is never any
- * any persistent damage.
+ * persistent damage.
  *
  * Only after a full scrub has been completed is it safe to start injecting
  * data corruption.  See the comment in zfs_fault_inject().
