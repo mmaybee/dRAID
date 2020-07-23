@@ -216,25 +216,36 @@ vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff,
 	const uint64_t ashift = vd->vdev_top->vdev_ashift;
 	const uint64_t b = loff >> ashift;
 
-	/* The size of a SLICE in units of the vdev's minimum sector size. */
+	/*
+	 * The size of a SLICE in units of the vdev's minimum sector size.
+	 * SLICE is the amount of data written to each disk of each group
+	 * in a given permutation.
+	 */
 	const uint64_t slice = DRAID_SLICESIZE >> ashift;
 
 	/*
-	 * We cycle through the disk permutations every SLICE * groupsz * ndisks
-	 * chunk of address space. This results in ndisks groups in each
-	 * permutation chunk (and guarantees alignment). So, for example,
-	 * if our slice size is 16MB, our group size is 10, and there are 13
-	 * data drives in the draid, then we will change permutation every
-	 * 2.08GB and each disk will have 150MB of data per chunk.
+	 * We cycle through a disk permutation every SLICE * groupsz * ngroups
+	 * chunk of address space. Note that ngroups * groupsz must be a
+	 * multiple of the number of data drives in order to guarantee
+	 * alignment. So, for example, if our slice size is 16MB, our group
+	 * size is 10, and there are 13 data drives in the draid, then ngroups
+	 * will be 13, we will change permutation every 2.08GB and each
+	 * disk will have 150MB of data per chunk.
 	 */
 	uint64_t ndata = vdc->vdc_data;
 	uint64_t groupsz = ndata + vdc->vdc_parity;
+	uint64_t ngroups = vdc->vdc_groups;
 	uint64_t ndisks = vdc->vdc_children - vdc->vdc_spares;
+	ASSERT3U(groupsz, >, 0);
+
+	/*
+	 * groupstart is where the group this IO will land in "starts" in
+	 * the permutation array.
+	 */
 	uint64_t group = b / (slice * groupsz);
 	uint64_t groupstart = (group * groupsz) % ndisks;
-
-	ASSERT3U(groupsz, >, 0);
 	ASSERT3U(groupstart + groupsz, <=, ndisks + groupstart);
+	*start = groupstart;
 
 	/* offset is the sector offset within a group chunk */
 	uint64_t offset = b % (slice * groupsz);
@@ -242,14 +253,16 @@ vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff,
 
 	/*
 	 * Find the starting byte offset on each child vdev:
-	 * - each permutation covers a groupsz * slice portion of the disk
-	 * - within a permutation there are ndisks groups spread over groupsz
+	 * - within a permutation there are ngroups groups spread over the
 	 *   rows, where each row covers a slice portion of the disk
+	 * - each permutation has (groupsz * ngroups) / ndisks rows
+	 * - so each permutation covers rows * slice portion of the disk
 	 * - so we need to find the row where this IO group target begins
 	 */
-	*perm = group / ndisks;
-	uint64_t row = (*perm * groupsz) + ((group % ndisks) * groupsz) / ndisks;
-	*start = groupstart;
+	*perm = group / ngroups;
+	uint64_t rows = (groupsz * ngroups) / ndisks;
+	ASSERT0((groupsz * ngroups) % ndisks);
+	uint64_t row = (*perm * rows) + ((group % ngroups) * groupsz) / ndisks;
 
 	return (((slice * row) + (offset / groupsz)) << ashift);
 }
