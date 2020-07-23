@@ -171,8 +171,7 @@ typedef struct ztest_shared_opts {
 	int zo_raid_children;
 	int zo_raid_parity;
 	char zo_raid_type[8];
-	int zo_draid_disks;
-	int zo_draid_groups;
+	int zo_draid_data;
 	int zo_draid_spares;
 	int zo_datasets;
 	int zo_threads;
@@ -200,8 +199,7 @@ static const ztest_shared_opts_t ztest_opts_defaults = {
 	.zo_raid_parity = 1,
 	.zo_raid_type = VDEV_TYPE_RAIDZ,
 	.zo_vdev_size = SPA_MINDEVSIZE * 4,	/* 256m default size */
-	.zo_draid_disks = 16,		/* data drives */
-	.zo_draid_groups = 3,		/* redundancy group count */
+	.zo_draid_data = 4,		/* data drives */
 	.zo_draid_spares = 1,		/* distributed spares */
 	.zo_datasets = 7,
 	.zo_threads = 23,
@@ -696,11 +694,10 @@ usage(boolean_t requested)
 	    "\t[-s size_of_each_vdev (default: %s)]\n"
 	    "\t[-a alignment_shift (default: %d)] use 0 for random\n"
 	    "\t[-m mirror_copies (default: %d)]\n"
-	    "\t[-r raidz_disks (default: %d)]\n"
+	    "\t[-r raidz_disks / draid_disks (default: %d)]\n"
 	    "\t[-R raid_parity (default: %d)]\n"
 	    "\t[-K raid_kind (default: random)] raidz|draid|random\n"
-	    "\t[-D draid_disks (default: %d)] in config\n"
-	    "\t[-G draid_groups (default: %d)] redundancy group count\n"
+	    "\t[-D draid_data (default: %d)] in config\n"
 	    "\t[-S draid_spares (default: %d)]\n"
 	    "\t[-d datasets (default: %d)]\n"
 	    "\t[-t threads (default: %d)]\n"
@@ -719,7 +716,7 @@ usage(boolean_t requested)
 	    "\t[-C vdev class state (default: random)] special=on|off|random\n"
 	    "\t[-o variable=value] ... set global variable to an unsigned\n"
 	    "\t    32-bit integer value\n"
-	    "\t[-L dump zfs_dbgmsg buffer before exiting due to an error\n"
+	    "\t[-G dump zfs_dbgmsg buffer before exiting due to an error\n"
 	    "\t[-h] (print help)\n"
 	    "",
 	    zo->zo_pool,
@@ -729,8 +726,7 @@ usage(boolean_t requested)
 	    zo->zo_mirrors,				/* -m */
 	    zo->zo_raid_children,			/* -r */
 	    zo->zo_raid_parity,				/* -R */
-	    zo->zo_draid_disks,				/* -D */
-	    zo->zo_draid_groups,			/* -G */
+	    zo->zo_draid_data,				/* -D */
 	    zo->zo_draid_spares,			/* -S */
 	    zo->zo_datasets,				/* -d */
 	    zo->zo_threads,				/* -t */
@@ -814,7 +810,7 @@ process_options(int argc, char **argv)
 	bcopy(&ztest_opts_defaults, zo, sizeof (*zo));
 
 	while ((opt = getopt(argc, argv,
-	    "v:s:a:m:r:R:K:D:G:S:d:t:g:i:k:p:f:MVET:P:hF:B:C:o:L")) != EOF) {
+	    "v:s:a:m:r:R:K:D:S:d:t:g:i:k:p:f:MVET:P:hF:B:C:o:G")) != EOF) {
 		value = 0;
 		switch (opt) {
 		case 'v':
@@ -824,7 +820,6 @@ process_options(int argc, char **argv)
 		case 'r':
 		case 'R':
 		case 'D':
-		case 'G':
 		case 'S':
 		case 'd':
 		case 't':
@@ -859,10 +854,7 @@ process_options(int argc, char **argv)
 			(void) strlcpy(raid_kind, optarg, sizeof (raid_kind));
 			break;
 		case 'D':
-			zo->zo_draid_disks = MAX(1, value);
-			break;
-		case 'G':
-			zo->zo_draid_groups = MAX(1, value);
+			zo->zo_draid_data = MAX(1, value);
 			break;
 		case 'S':
 			zo->zo_draid_spares = MAX(1, value);
@@ -927,7 +919,7 @@ process_options(int argc, char **argv)
 			if (set_global_var(optarg) != 0)
 				usage(B_FALSE);
 			break;
-		case 'L':
+		case 'G':
 			zo->zo_dump_dbgmsg = 1;
 			break;
 		case 'h':
@@ -952,14 +944,6 @@ process_options(int argc, char **argv)
 	if (strcmp(raid_kind, "draid") == 0) {
 		uint64_t min_devsize;
 
-		ztest_opts.zo_raid_children = zo->zo_draid_disks;
-		if (zo->zo_draid_disks < (zo->zo_draid_groups *
-		    (1 + zo->zo_raid_parity)) + zo->zo_draid_spares) {
-			(void) fprintf(stderr, "error: draid size (%d) too"
-			    "small\n", zo->zo_draid_disks);
-			usage(B_FALSE);
-		}
-
 		/* With fewer disk use 256M, otherwise 128M is OK */
 		min_devsize = (ztest_opts.zo_raid_children < 16) ?
 		    (256ULL << 20) : (128ULL << 20);
@@ -970,10 +954,22 @@ process_options(int argc, char **argv)
 		/* Use more appropriate defaults for dRAID */
 		if (zo->zo_vdevs == ztest_opts_defaults.zo_vdevs)
 			zo->zo_vdevs = 1;
+		if (zo->zo_raid_children ==
+		    ztest_opts_defaults.zo_raid_children)
+			zo->zo_raid_children = 16;
 		if (zo->zo_ashift < 12)
 			zo->zo_ashift = 12;
 		if (zo->zo_vdev_size < min_devsize)
 			zo->zo_vdev_size = min_devsize;
+
+		if (zo->zo_draid_data + zo->zo_raid_parity >
+		    zo->zo_raid_children - zo->zo_draid_spares) {
+			(void) fprintf(stderr, "error: too few draid "
+			    "children (%d) for stripe width (%d)\n",
+			    zo->zo_raid_children,
+			    zo->zo_draid_data + zo->zo_raid_parity);
+			usage(B_FALSE);
+		}
 
 		(void) strlcpy(zo->zo_raid_type, VDEV_TYPE_DRAID,
 		    sizeof (zo->zo_raid_type));
@@ -1153,7 +1149,7 @@ make_vdev_raid(char *path, char *aux, char *pool, size_t size,
 	if (strcmp(ztest_opts.zo_raid_type, VDEV_TYPE_DRAID) == 0) {
 		nvlist_t *draidcfg;
 		VERIFY3S(vdev_draid_config_generate(
-		    ztest_opts.zo_draid_groups, 0, ztest_opts.zo_raid_parity,
+		    ztest_opts.zo_draid_data, ztest_opts.zo_raid_parity,
 		    ztest_opts.zo_draid_spares, ztest_opts.zo_raid_children,
 		    DRAIDCFG_DEFAULT_PASSES, DRAIDCFG_DEFAULT_EVAL,
 		    DRAIDCFG_DEFAULT_FAULTS, &draidcfg), ==, DRAIDCFG_OK);

@@ -63,7 +63,7 @@ set -A args  "" "-?" "-n" "-f" "-nf" "-fn" "-f -n" "--f" "-e" "-s" \
 	"$TESTPOOL DRAID $DISK1 $DISK2 $DISK3" "$TESTPOOL raidz $DISK0" \
 	"$TESTPOOL raidz1 $DISK0" "$TESTPOOL draid $DISK0 $DISK1" \
 	"$TESTPOOL draid2 $DISK0 $DISK1 $DISK2" \
-	"$TESTPOOL draid $DISK0 $DISK1 $DISK2 spare s0-draid1:1g:1s-0" \
+	"$TESTPOOL draid $DISK0 $DISK1 $DISK2 spare s0-draid1:1d:1s-0" \
 	"1tank $DISK0" "1234 $DISK0" "?tank $DISK0" \
 	"tan%k $DISK0" "ta@# $DISK0" "tan+k $DISK0" \
 	"$BYND_MAX_NAME $DISK0"

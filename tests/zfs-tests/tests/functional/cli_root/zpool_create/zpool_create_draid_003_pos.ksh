@@ -27,12 +27,12 @@
 
 #
 # DESCRIPTION:
-# Verify a specific number of dRAID groups and hot spares may be
+# Verify allowed striped widths (data+parity) and hot spares may be
 # configured at pool creation time.
 #
 # STRATEGY:
-# 1) Test valid group/spare combinations given the number of children.
-# 2) Test invalid group/spare combinations outside the allow limits.
+# 1) Test valid stripe/spare combinations given the number of children.
+# 2) Test invalid stripe/spare combinations outside the allow limits.
 #
 
 verify_runnable "global"
@@ -41,25 +41,30 @@ function cleanup
 {
 	poolexists $TESTPOOL && destroy_pool $TESTPOOL
 
-	rm -f $all_vdevs
+	rm -f $draid_vdevs
 	rmdir $TESTDIR
 }
 
-log_assert "'zpool create <pool> draid:#g:#s <vdevs>'"
+log_assert "'zpool create <pool> draid:#d:#s <vdevs>'"
 
 log_onexit cleanup
 
-all_vdevs=$(echo $TESTDIR/file.{01..33})
-draid_vdevs=$(echo $TESTDIR/file.{01..32})
+parity=1
+children=32
+draid_vdevs=$(echo $TESTDIR/file.{01..$children})
 
 mkdir $TESTDIR
-log_must truncate -s $MINVDEVSIZE $all_vdevs
+log_must truncate -s $MINVDEVSIZE $draid_vdevs
 
-# Request from 1-10 groups. (32 wide to 3 wide stripes).
-for g in {1..10}; do
-	# Request from 1-3 hot spares.
-	for s in {1..3}; do
-		log_must zpool create $TESTPOOL draid:${g}g:${s}s $draid_vdevs
+# Request from 1-3 hot spares.
+for s in {1..3}; do
+	max_data=$((children - s - parity))
+
+	# Request all valid stripe widths up to the maximum.
+	# Iterations are set to 1 solely to speed up the test.
+	for d in {1..$max_data}; do
+		log_must zpool create $TESTPOOL \
+		    draid:${d}d:${s}s:1i $draid_vdevs
 		log_must poolexists $TESTPOOL
 		destroy_pool $TESTPOOL
 	done
@@ -68,21 +73,18 @@ done
 # Exceeds maximum pairty (3).
 log_mustnot zpool create $TESTPOOL draid4 $draid_vdevs
 
-# Exceeds maximum group size (32).
-log_mustnot zpool create $TESTPOOL draid2:1g $all_vdevs
+# Exceeds maximum data disks (limited by total children)
+log_mustnot zpool create $TESTPOOL draid2:30d $draid_vdevs
 
-# Below minimum group size (parity + 1).
-log_mustnot zpool create $TESTPOOL draid2:11g $draid_vdevs
-
-# Spares may not exceed (children - (groups * (parity + data))).
-log_must zpool create $TESTPOOL draid2:2g:25s $draid_vdevs
+# Spares may not exceed (children - (parity + data))).
+log_must zpool create $TESTPOOL draid2:20d:10s $draid_vdevs
 log_must poolexists $TESTPOOL
 destroy_pool $TESTPOOL
-log_mustnot zpool create $TESTPOOL draid2:26s $draid_vdevs
+log_mustnot zpool create $TESTPOOL draid2:20d:11s $draid_vdevs
 
-# At least one group or spare must be requested.
-log_mustnot zpool create $TESTPOOL draid2:0g $draid_vdevs
+# At least one data or spare disk must be requested.
+log_mustnot zpool create $TESTPOOL draid2:0d $draid_vdevs
 log_mustnot zpool create $TESTPOOL draid2:0s $draid_vdevs
-log_mustnot zpool create $TESTPOOL draid2:0s:0g $draid_vdevs
+log_mustnot zpool create $TESTPOOL draid2:0s:0d $draid_vdevs
 
-log_pass "'zpool create <pool> draid:#g:#s <vdevs>'"
+log_pass "'zpool create <pool> draid:#d:#s <vdevs>'"

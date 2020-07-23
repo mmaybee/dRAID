@@ -60,7 +60,7 @@ for type in "mirror" "raidz" "raidz2" "draid"; do
 		# 1. Create a dRAID pool with a distributed hot spare
 		truncate -s $SPA_MINDEVSIZE $VDEV_FILES
 		log_must zpool create -f $TESTPOOL $type $VDEV_FILES
-		SPARE="s0-draid1:1g:1s-0"
+		SPARE="s0-draid1:2d:1s-0"
 	else
 		# 1. Create a pool with hot spares
 		truncate -s $SPA_MINDEVSIZE $VDEV_FILES $SPARE_FILE

@@ -52,10 +52,10 @@ for replace_mode in "healing" "sequential"; do
 
 	parity=$(random_int_between 1 3)
 	spares=$(random_int_between $parity 3)
-	groups=$(random_int_between 1 3)
-	draid="draid${parity}:${groups}g:${spares}s"
+	data=$(random_int_between 1 8)
+	draid="draid${parity}:${data}d:${spares}s"
 
-	(( min_children = (groups * (parity + 1)) + spares ))
+	(( min_children = (data + parity + spares) ))
 
 	typeset -i cnt=$(random_int_between $min_children 20)
 

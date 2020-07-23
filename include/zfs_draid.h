@@ -46,15 +46,15 @@ extern "C" {
 /*
  * These values apply reasonable limits to a dRAID configuration.
  */
-#define	VDEV_DRAID_MAX_GROUPSIZE	32
+#define	VDEV_DRAID_MAX_GROUPSIZE	128
 #define	VDEV_DRAID_MAX_GROUPS		VDEV_DRAID_MAX_CHILDREN
 #define	VDEV_DRAID_MAX_SPARES		100
 
 /*
- * When a specific number of groups was not provided create enough
- * groups such that each group contains no more than this many devices.
+ * When a specific number of data disks was not provided apply a limit
+ * of 12 data disks to each redundancy group.
  */
-#define	VDEV_DRAID_TGT_GROUPSIZE	12
+#define	VDEV_DRAID_TGT_DATA		12
 
 /*
  * The default number of passes when developing a new dRAID configuration.
@@ -139,7 +139,7 @@ typedef enum {
 	DRAIDCFG_ERR_PERM_INVALID,	/* perm value is invalid */
 	DRAIDCFG_ERR_PERM_MISMATCH,	/* perm value is inconsistent */
 	DRAIDCFG_ERR_PERM_DUPLICATE,	/* perm value is a duplicate */
-	DRAIDCFG_ERR_LAYOUT,		/* layout (n - s) != (d + p) */
+	DRAIDCFG_ERR_LAYOUT,		/* groups entirely fill slice */
 	DRAIDCFG_ERR_INTERNAL,		/* internal error */
 } draidcfg_err_t;
 
@@ -169,7 +169,7 @@ extern boolean_t vdev_draid_is_spare(const char *);
 #define	DRAIDCFG_DEFAULT_FILE	"defaults"
 
 extern draidcfg_err_t vdev_draid_config_generate(uint64_t, uint64_t, uint64_t,
-    uint64_t, uint64_t, int, draidcfg_eval_t, int, nvlist_t **);
+    uint64_t, int, draidcfg_eval_t, int, nvlist_t **);
 extern void vdev_draid_config_free(nvlist_t *);
 extern int vdev_draid_config_read_file(const char *, char *, nvlist_t **);
 extern int vdev_draid_config_write_file(const char *, char *, nvlist_t *);

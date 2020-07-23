@@ -4148,7 +4148,7 @@ spa_ld_open_aux_vdevs(spa_t *spa, spa_import_type_t type)
 	if (error == 0 && type != SPA_IMPORT_ASSEMBLE) {
 		ASSERT(spa_version(spa) >= SPA_VERSION_SPARES);
 		error = load_nvlist(spa, spa->spa_spares.sav_object,
-                    &spa->spa_spares.sav_config);
+		    &spa->spa_spares.sav_config);
 		ASSERT0(error);
 		if (error != 0) {
 			spa_load_failed(spa, "error loading spares nvlist");

@@ -117,7 +117,7 @@ vdev_draid_map_alloc_write(zio_t *zio, raidz_map_t *rm)
 		} else {
 			ASSERT0(rc->rc_size);
 			ASSERT3U(skip_size, ==, parity_size);
-			/* empty data column (small write), allocate skip sector */
+			/* empty data column (small write), add a skip sector */
 			rc->rc_abd = abd_get_zeros(skip_size);
 		}
 
@@ -455,7 +455,7 @@ uint64_t
 vdev_draid_offset_to_group(const vdev_t *vd, uint64_t offset)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t groupsz = 
+	uint64_t groupsz =
 	    (vdc->vdc_data + vd->vdev_nparity) << DRAID_SLICESHIFT;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
@@ -473,7 +473,7 @@ vdev_draid_group_to_offset(const vdev_t *vd, uint64_t group)
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	uint64_t groupsz = 
+	uint64_t groupsz =
 	    (vdc->vdc_data + vd->vdev_nparity) << DRAID_SLICESHIFT;
 	return (group * groupsz);
 }
@@ -1151,7 +1151,7 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 	ASSERT(raidvd->vdev_ops == &vdev_draid_ops);
 
 	vdev_draid_config_t *vdc = raidvd->vdev_tsd;
-	uint64_t ashift = raidvd->vdev_top->vdev_ashift;
+	uint64_t ashift __maybe_unused = raidvd->vdev_top->vdev_ashift;
 
 	/* Make sure the offsets are block-aligned */
 	ASSERT0(in->rs_start % (1 << ashift));

@@ -83,7 +83,7 @@ Used alignment in test.
 .IP
 Number of mirror copies.
 .HP
-.BI "\-r" " raidz_disks" " (default: 4)"
+.BI "\-r" " raidz_disks / draid_disks" " (default: 4 / 16)"
 .IP
 Number of raidz disks.
 .HP
@@ -95,13 +95,9 @@ Raid parity (raidz & draid).
 .IP
 The kind of RAID config to use. With 'random' the kind alternates between raidz and draid.
 .HP
-.BI "\-D" " draid_data_disks" " (default: 4)"
+.BI "\-D" " draid_data" " (default: 4)"
 .IP
 Number of data disks in a dRAID redundancy group.
-.HP
-.BI "\-G" " draidz_groups" " (default: 2)"
-.IP
-Number of dRAID redundancy groups.
 .HP
 .BI "\-S" " draid_spares" " (default: 1)"
 .IP
@@ -151,7 +147,7 @@ Total test run time.
 .IP
 Injected failure rate.
 .HP
-.BI "\-L"
+.BI "\-G"
 .IP
 Dump zfs_dbgmsg buffer before exiting.
 .SH "EXAMPLES"

@@ -1291,26 +1291,22 @@ is_grouping(const char *type, int *mindev, int *maxdev)
  * Extract the configuration parameters encoded in the dRAID type and
  * used them to generate a dRAID configuration.  The expected format is:
  *
- * draid[<parity>][:<groups><g|G>][:<spares><s|S>][:<data><d|D>]
+ * draid[<parity>][:<data><d|D>][:<spares><s|S>]
  *
  * The intent is to be able to generate a configuration even when no
  * additional information is provided.  The only mandatory component
  * of the type is the "draid" prefix.  If a value is not provided sane
  * defaults will used.  The optional components may appear in any order
- * but the gG/sS/dD suffix is required.
+ * but the dD/sS suffix is required.
  *
  * Defaults:
  * - Single parity
+ * - Target group size of 12 (data + parity)
  * - Single distributed spare
- * - Groups based on number of children:
- *   1 Group:  1-12 children,
- *   2 Groups: 13-24 children,
- *   3 Groups: 25-36 children,
- *   ...
  *
  * Examples:
  * zpool create tank draid <devices...>
- * zpool create tank draid2:1s <devices...>
+ * zpool create tank draid2:8d:1s <devices...>
  *
  * Highly optimized configurations can be developed by using the optional
  * syntax [:<passes><i|I>].  Performing more passes when developing the
@@ -1319,12 +1315,11 @@ is_grouping(const char *type, int *mindev, int *maxdev)
  * time required to create a new pool.
  *
  * Examples:
- * zpool create tank draid2:8g:4s:8d:1000000i <exactly 84 devices>
+ * zpool create tank draid2:10d:2s:1000000i
  */
 static nvlist_t *
 draid_config_by_type(const char *type, uint64_t children)
 {
-	uint64_t groups = ((children - 1) / VDEV_DRAID_TGT_GROUPSIZE) + 1;
 	uint64_t parity = 1;
 	uint64_t spares = 1;
 	uint64_t data = 0;
@@ -1346,11 +1341,10 @@ draid_config_by_type(const char *type, uint64_t children)
 		p = p + 1;
 		errno = 0;
 
-		/* Expected non-zero value with gGsSdDiI suffix */
+		/* Expected non-zero value with dDsSiI suffix */
 		value = strtol(p, &end, 10);
 		if (errno != 0 || value == 0 ||
-		    (*end != 'g' && *end != 'G' &&
-		    *end != 's' && *end != 'S' &&
+		    (*end != 's' && *end != 'S' &&
 		    *end != 'd' && *end != 'D' &&
 		    *end != 'i' && *end != 'I')) {
 			(void) fprintf(stderr, gettext("invalid dRAID "
@@ -1358,9 +1352,7 @@ draid_config_by_type(const char *type, uint64_t children)
 			return (NULL);
 		}
 
-		if (*end == 'g' || *end == 'G') {
-			groups = (uint64_t)value;
-		} else if (*end == 's' || *end == 'S') {
+		if (*end == 's' || *end == 'S') {
 			spares = (uint64_t)value;
 		} else if (*end == 'd' || *end == 'D') {
 			data = (uint64_t)value;
@@ -1371,17 +1363,21 @@ draid_config_by_type(const char *type, uint64_t children)
 		}
 	}
 
+	if (data == 0)
+		data = MIN(children - spares - parity, VDEV_DRAID_TGT_DATA);
+
+
 	char fullpath[MAXPATHLEN];
 	char key[MAXNAMELEN];
 	nvlist_t *cfg = NULL;
 	draidcfg_err_t error;
 
-	error = vdev_draid_config_generate(groups, data, parity, spares,
+	error = vdev_draid_config_generate(data, parity, spares,
 	    children, passes, eval, DRAIDCFG_DEFAULT_FAULTS, &cfg);
 
 	switch (error) {
 	case DRAIDCFG_OK:
-		(void) vdev_draid_name(key, sizeof (key), parity, groups,
+		(void) vdev_draid_name(key, sizeof (key), parity, data,
 		    spares, children);
 		(void) snprintf(fullpath, MAXPATHLEN - 1, "%s/%s",
 		    DRAIDCFG_DEFAULT_DIR, key);
@@ -1396,14 +1392,13 @@ draid_config_by_type(const char *type, uint64_t children)
 		return (cfg);
 	case DRAIDCFG_ERR_GROUPS_INVALID:
 		fprintf(stderr,
-		    gettext("invalid number of dRAID groups %llu; must be "
-		    "between 1 and %d\n"), (u_longlong_t)groups,
-		    VDEV_DRAID_MAX_GROUPS);
+		    gettext("invalid number of dRAID groups; must be "
+		    "less than %d\n"), VDEV_DRAID_MAX_GROUPS);
 		break;
 	case DRAIDCFG_ERR_DATA_INVALID:
 		fprintf(stderr,
-		    gettext("invalid dRAID group size %llu; %d devices "
-		    "allowed per group\n"), (u_longlong_t)(children / groups),
+		    gettext("invalid dRAID stripe size %llu; %d devices "
+		    "allowed per stripe\n"), (u_longlong_t)(data + parity),
 		    VDEV_DRAID_MAX_GROUPSIZE);
 		break;
 	case DRAIDCFG_ERR_PARITY_INVALID:
@@ -1424,16 +1419,7 @@ draid_config_by_type(const char *type, uint64_t children)
 		    VDEV_DRAID_MAX_CHILDREN);
 		break;
 	case DRAIDCFG_ERR_LAYOUT:
-		fprintf(stderr,
-		    gettext("invalid layout, each top-level dRAID vdev "
-		    "requires that the number of child\nvdevs less the number "
-		    "of distributed spares, must equal the number of groups\n"
-		    "times the number of vdevs per group (data + parity).\n\n"
-		    "%s: (%llu vdevs - %llu spares) != (%llu groups * "
-		    "(%llu data + %llu parity))\n"), type,
-		    (u_longlong_t)children, (u_longlong_t)spares,
-		    (u_longlong_t)groups, (u_longlong_t)data,
-		    (u_longlong_t)parity);
+		fprintf(stderr, gettext("invalid layout\n"));
 		break;
 	case DRAIDCFG_ERR_INTERNAL:
 		fprintf(stderr,
