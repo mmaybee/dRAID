@@ -150,10 +150,9 @@ extern draidcfg_err_t vdev_draid_config_validate(nvlist_t *, uint64_t,
     uint64_t, uint64_t, uint64_t);
 extern char *vdev_draid_name(char *, int, uint64_t, uint64_t, uint64_t,
     uint64_t);
-extern char *vdev_draid_spare_name(char *, int, uint64_t, uint64_t, uint64_t,
-    uint64_t, uint64_t);
+extern char *vdev_draid_spare_name(char *, int, uint64_t, uint64_t, uint64_t);
 extern int vdev_draid_spare_values(const char *, uint64_t *, uint64_t *,
-    uint64_t *, uint64_t *, uint64_t *);
+    uint64_t *);
 extern boolean_t vdev_draid_is_spare(const char *);
 
 /*

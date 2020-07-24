@@ -64,7 +64,7 @@ for replace_mode in "healing" "sequential"; do
 	i=0
 	while [[ $i -lt $spares ]]; do
 		fault_vdev="$BASEDIR/vdev$i"
-		spare_vdev="s${i}-${draid}-0"
+		spare_vdev="s${i}-draid${parity}-0"
 		log_must zpool offline -f $TESTPOOL $fault_vdev
 		log_must zpool replace -w $flags $TESTPOOL \
 		    $fault_vdev $spare_vdev

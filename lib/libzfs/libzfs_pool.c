@@ -4053,20 +4053,22 @@ zpool_vdev_name(libzfs_handle_t *hdl, zpool_handle_t *zhp, nvlist_t *nv,
 		 * If it's a dRAID device, we add parity, groups, and spares.
 		 */
 		if (strcmp(path, VDEV_TYPE_DRAID) == 0) {
-			uint64_t parity, groups, spares;
+			uint64_t data, parity, spares, children;
 			nvlist_t *cfg;
 
 			verify(nvlist_lookup_nvlist(nv, ZPOOL_CONFIG_DRAIDCFG,
 			    &cfg) == 0);
 			verify(nvlist_lookup_uint64(cfg,
+			    ZPOOL_CONFIG_DRAIDCFG_DATA, &data) == 0);
+			verify(nvlist_lookup_uint64(cfg,
 			    ZPOOL_CONFIG_DRAIDCFG_PARITY, &parity) == 0);
 			verify(nvlist_lookup_uint64(cfg,
-			    ZPOOL_CONFIG_DRAIDCFG_GROUPS, &groups) == 0);
-			verify(nvlist_lookup_uint64(cfg,
 			    ZPOOL_CONFIG_DRAIDCFG_SPARES, &spares) == 0);
+			verify(nvlist_lookup_uint64(cfg,
+			    ZPOOL_CONFIG_DRAIDCFG_CHILDREN, &children) == 0);
 
-			path = vdev_draid_name(buf, sizeof (buf), parity,
-			    groups, spares, 0);
+			path = vdev_draid_name(buf, sizeof (buf), data,
+			    parity, spares, children);
 		}
 
 		/*

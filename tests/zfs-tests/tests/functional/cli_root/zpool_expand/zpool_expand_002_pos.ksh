@@ -180,8 +180,7 @@ for type in " " mirror raidz draid; do
 	# For dRAID pools verify the distributed spare was resized after
 	# expansion and it is large enough to be used to replace a pool vdev.
 	if [[ $type == "draid" ]]; then
-		log_must zpool replace -w $TESTPOOL1 $TEMPFILE.3 \
-		    s0-draid1:1d:1s-0
+		log_must zpool replace -w $TESTPOOL1 $TEMPFILE.3 s0-draid1-0
 		verify_pool $TESTPOOL1
 	fi
 

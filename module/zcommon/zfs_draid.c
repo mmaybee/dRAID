@@ -157,19 +157,13 @@ vdev_draid_config_validate(nvlist_t *config,
  * to the end of the string.
  */
 char *
-vdev_draid_name(char *name, int len, uint64_t parity, uint64_t data,
+vdev_draid_name(char *name, int len, uint64_t data, uint64_t parity,
     uint64_t spares, uint64_t children)
 {
-	int offset = 0;
-
 	bzero(name, len);
-	offset = snprintf(name, len - 1, "%s%llu:%llud:%llus", VDEV_TYPE_DRAID,
-	    (u_longlong_t)parity, (u_longlong_t)data, (u_longlong_t)spares);
-
-	if (children != 0 && offset < len) {
-		(void) snprintf(name + offset, (len - offset) - 1, ":%lluc",
-		    (u_longlong_t)children);
-	}
+	snprintf(name, len - 1, "%s%llu:%llud:%llus:%lluc",
+	    VDEV_TYPE_DRAID, (u_longlong_t)parity, (u_longlong_t)data,
+	    (u_longlong_t)spares, (u_longlong_t)children);
 
 	return (name);
 }
@@ -178,13 +172,13 @@ vdev_draid_name(char *name, int len, uint64_t parity, uint64_t data,
  * Output a dRAID spare vdev name in to the provided buffer.
  */
 char *
-vdev_draid_spare_name(char *name, int len, uint64_t parity, uint64_t data,
-    uint64_t spares, uint64_t vdev_id, uint64_t spare_id)
+vdev_draid_spare_name(char *name, int len, uint64_t spare_id,
+    uint64_t parity, uint64_t vdev_id)
 {
 	bzero(name, len);
-	(void) snprintf(name, len - 1, "s%llu-%s%llu:%llud:%llus-%llu",
+	(void) snprintf(name, len - 1, "s%llu-%s%llu-%llu",
 	    (u_longlong_t)spare_id, VDEV_TYPE_DRAID, (u_longlong_t)parity,
-	    (u_longlong_t)data, (u_longlong_t)spares, (u_longlong_t)vdev_id);
+	    (u_longlong_t)vdev_id);
 
 	return (name);
 }
@@ -193,13 +187,12 @@ vdev_draid_spare_name(char *name, int len, uint64_t parity, uint64_t data,
  * Parse dRAID configuration information out of the passed dRAID spare name.
  */
 int
-vdev_draid_spare_values(const char *name, uint64_t *parity, uint64_t *data,
-    uint64_t *spares, uint64_t *vdev_id, uint64_t *spare_id)
+vdev_draid_spare_values(const char *name, uint64_t *spare_id,
+    uint64_t *parity, uint64_t *vdev_id)
 {
-	if (sscanf(name, "s%llu-" VDEV_TYPE_DRAID "%llu:%llud:%llus-%llu",
+	if (sscanf(name, "s%llu-" VDEV_TYPE_DRAID "%llu-%llu",
 	    (u_longlong_t *)spare_id, (u_longlong_t *)parity,
-	    (u_longlong_t *)data, (u_longlong_t *)spares,
-	    (u_longlong_t *)vdev_id) != 5) {
+	    (u_longlong_t *)vdev_id) != 3) {
 		return (EINVAL);
 	}
 
@@ -212,10 +205,9 @@ vdev_draid_spare_values(const char *name, uint64_t *parity, uint64_t *data,
 boolean_t
 vdev_draid_is_spare(const char *name)
 {
-	uint64_t parity, data, spares, vdev_id, spare_id;
+	uint64_t spare_id, parity, vdev_id;
 
-	return (vdev_draid_spare_values(name, &parity, &data, &spares,
-	    &vdev_id, &spare_id) == 0);
+	return (!vdev_draid_spare_values(name, &spare_id, &parity, &vdev_id));
 }
 
 /*
@@ -945,7 +937,7 @@ find_known_config(uint64_t data, uint64_t parity, uint64_t spares,
 	while ((ent = readdir(dir)) != NULL) {
 		(void) snprintf(fullpath, MAXPATHLEN - 1, "%s/%s",
 		    dirpath, ent->d_name);
-		(void) vdev_draid_name(key, sizeof (key), parity, data,
+		(void) vdev_draid_name(key, sizeof (key), data, parity,
 		    spares, children);
 
 		/*

@@ -1377,7 +1377,7 @@ draid_config_by_type(const char *type, uint64_t children)
 
 	switch (error) {
 	case DRAIDCFG_OK:
-		(void) vdev_draid_name(key, sizeof (key), parity, data,
+		(void) vdev_draid_name(key, sizeof (key), data, parity,
 		    spares, children);
 		(void) snprintf(fullpath, MAXPATHLEN - 1, "%s/%s",
 		    DRAIDCFG_DEFAULT_DIR, key);

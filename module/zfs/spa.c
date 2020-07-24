@@ -5666,8 +5666,7 @@ spa_add_draid_spare(nvlist_t *nvroot, vdev_t *rvd)
 
 			fnvlist_add_string(ds, ZPOOL_CONFIG_PATH,
 			    vdev_draid_spare_name(path, sizeof (path),
-			    c->vdev_nparity, c->vdev_groups, c->vdev_spares,
-			    c->vdev_id, j));
+			    j, c->vdev_nparity, c->vdev_id));
 			fnvlist_add_string(ds, ZPOOL_CONFIG_TYPE,
 			    VDEV_TYPE_DRAID_SPARE);
 			fnvlist_add_uint64(ds, ZPOOL_CONFIG_IS_LOG, 0);

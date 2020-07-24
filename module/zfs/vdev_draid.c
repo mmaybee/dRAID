@@ -1248,12 +1248,12 @@ typedef struct {
 vdev_t *
 vdev_draid_spare_get_parent(vdev_t *vd)
 {
-	uint64_t parity, groups, spares, vdev_id, spare_id;
+	uint64_t spare_id, parity, vdev_id;
 	vdev_t *rvd = vd->vdev_spa->spa_root_vdev;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
-	if (vdev_draid_spare_values(vd->vdev_path, &parity, &groups,
-	    &spares, &vdev_id, &spare_id) != 0) {
+	if (vdev_draid_spare_values(vd->vdev_path, &spare_id, &parity,
+	    &vdev_id) != 0) {
 		return (NULL);
 	}
 
@@ -1359,7 +1359,7 @@ static int
 vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
     uint64_t *ashift)
 {
-	uint64_t parity, groups, spares, vdev_id, spare_id;
+	uint64_t spare_id, parity, vdev_id;
 	uint64_t asize, max_asize;
 	vdev_draid_config_t *vdc;
 	vdev_draid_spare_t *vds;
@@ -1375,8 +1375,8 @@ vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	}
 
 	/* Extract dRAID configuration values from the provided vdev */
-	error = vdev_draid_spare_values(vd->vdev_path, &parity, &groups,
-	    &spares, &vdev_id, &spare_id);
+	error = vdev_draid_spare_values(vd->vdev_path, &spare_id, &parity,
+	    &vdev_id);
 	if (error)
 		return (error);
 
@@ -1391,10 +1391,8 @@ vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 		return (SET_ERROR(EINVAL));
 
 	/* Spare name dRAID settings agree with top-level dRAID vdev */
-	if (vdc->vdc_parity != parity ||
-	    vdc->vdc_spares != spares || vdc->vdc_spares <= spare_id) {
+	if (vdc->vdc_parity != parity || vdc->vdc_spares <= spare_id)
 		return (SET_ERROR(EINVAL));
-	}
 
 	vds = kmem_alloc(sizeof (vdev_draid_spare_t), KM_SLEEP);
 	vds->vds_draid_vdev = tvd;

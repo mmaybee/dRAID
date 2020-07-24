@@ -157,7 +157,7 @@ test_replacing_vdevs "raidz $VDEV0 $VDEV1 $VDEV2" \
 
 test_replacing_vdevs "draid $VDEV0 $VDEV1 $VDEV2 $VDEV3" \
 	"$VDEV1" "$VDEV4" \
-	"draid $VDEV0 $VDEV4 $VDEV2 $VDEV3 spares s0-draid1:1d:1s-0" \
+	"draid $VDEV0 $VDEV4 $VDEV2 $VDEV3 spares s0-draid1-0" \
 	"$VDEV0 $VDEV1 $VDEV2 $VDEV3" \
 	true 30
 

@@ -75,8 +75,8 @@ for type in "mirror" "raidz" "raidz2" "raidz3" "draid2:2s"; do
 		# 1. Create a dRAID pool with two distributed hot spares
 		truncate -s $SPA_MINDEVSIZE $DATA_DEVS
 		log_must zpool create -f $TESTPOOL $type $DATA_DEVS
-		SPARE1="s0-draid2:2d:2s-0"
-		SPARE2="s1-draid2:2d:2s-0"
+		SPARE1="s0-draid2-0"
+		SPARE2="s1-draid2-0"
 	elif [ "$type" = "mirror" ]; then
 		# 1. Create a 3-way mirror pool with two hot spares
 		truncate -s $SPA_MINDEVSIZE $DATA_DEVS $SPARE_DEVS
@@ -146,8 +146,8 @@ for type in "mirror" "raidz2" "raidz3" "draid2:2s"; do
 		# 1. Create a dRAID pool with two distributed hot spares
 		truncate -s $SPA_MINDEVSIZE $DATA_DEVS
 		log_must zpool create -f $TESTPOOL $type $DATA_DEVS
-		SPARE1="s0-draid2:2d:2s-0"
-		SPARE2="s1-draid2:2d:2s-0"
+		SPARE1="s0-draid2-0"
+		SPARE2="s1-draid2-0"
 	elif [ "$type" = "mirror" ]; then
 		# 1. Create a 3-way mirror pool with two hot spares
 		truncate -s $SPA_MINDEVSIZE $DATA_DEVS $SPARE_DEVS
