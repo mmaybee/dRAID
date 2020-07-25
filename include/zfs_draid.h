@@ -51,10 +51,11 @@ extern "C" {
 #define	VDEV_DRAID_MAX_SPARES		100
 
 /*
- * When a specific number of data disks was not provided apply a limit
- * of 12 data disks to each redundancy group.
+ * When a specific number of data disks is not provided limit a redundancy
+ * group to 8 data disks.  This value was selected to provide a reasonable
+ * tradeoff between capacity and performance.
  */
-#define	VDEV_DRAID_TGT_DATA		12
+#define	VDEV_DRAID_TGT_DATA		8
 
 /*
  * The default number of passes when developing a new dRAID configuration.

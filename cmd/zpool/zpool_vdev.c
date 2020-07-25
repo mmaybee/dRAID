@@ -1344,20 +1344,30 @@ draid_config_by_type(const char *type, uint64_t children)
 		/* Expected non-zero value with dDsSiI suffix */
 		value = strtol(p, &end, 10);
 		if (errno != 0 || value == 0 ||
-		    (*end != 's' && *end != 'S' &&
+		    (*end != 'c' && *end != 'C' &&
 		    *end != 'd' && *end != 'D' &&
-		    *end != 'i' && *end != 'I')) {
+		    *end != 'i' && *end != 'I' &&
+		    *end != 's' && *end != 'S')) {
 			(void) fprintf(stderr, gettext("invalid dRAID "
 			    "type syntax: %s\n"), type);
 			return (NULL);
 		}
 
-		if (*end == 's' || *end == 'S') {
-			spares = (uint64_t)value;
+		if (*end == 'c' || *end == 'C') {
+			if ((uint64_t)value != children) {
+				fprintf(stderr,
+				    gettext("invalid number of dRAID children; "
+				    "%llu required but %llu provided\n"),
+				    (u_longlong_t)value,
+				    (u_longlong_t)children);
+				return (NULL);
+			}
 		} else if (*end == 'd' || *end == 'D') {
 			data = (uint64_t)value;
 		} else if (*end == 'i' || *end == 'I') {
 			passes = (uint64_t)value;
+		} else if (*end == 's' || *end == 'S') {
+			spares = (uint64_t)value;
 		} else {
 			verify(0); /* Unreachable */
 		}

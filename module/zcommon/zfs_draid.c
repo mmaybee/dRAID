@@ -161,9 +161,9 @@ vdev_draid_name(char *name, int len, uint64_t data, uint64_t parity,
     uint64_t spares, uint64_t children)
 {
 	bzero(name, len);
-	snprintf(name, len - 1, "%s%llu:%llud:%llus:%lluc",
+	snprintf(name, len - 1, "%s%llu:%llud:%lluc:%llus",
 	    VDEV_TYPE_DRAID, (u_longlong_t)parity, (u_longlong_t)data,
-	    (u_longlong_t)spares, (u_longlong_t)children);
+	    (u_longlong_t)children, (u_longlong_t)spares);
 
 	return (name);
 }
@@ -734,17 +734,15 @@ print_map_stats(draid_map_t *map, draidcfg_eval_t eval, int print_ios)
 		    (eval == DRAIDCFG_EVAL_WORST) ? "Worst" :
 		    (eval == DRAIDCFG_EVAL_MEAN) ? "Mean"  : "Rms",
 		    map->ndevs, map->nspares, map->ngroups, map->nrows, score);
-	}
 
-	if (map->ndevs < 80 && score >= 1.05) {
-		printf("Warning score %6.3f has over 5 percent imbalance!\n",
-		    score);
-	} else if (score >= 1.1) {
-		printf("Warning score %6.3f has over 10 percent imbalance!\n",
-		    score);
-	}
+		if (map->ndevs < 80 && score >= 1.05) {
+			printf("Warning score %6.3f has over 5 percent "
+			    "imbalance!\n", score);
+		} else if (score >= 1.1) {
+			printf("Warning score %6.3f has over 10 percent "
+			    "imbalance!\n", score);
+		}
 
-	if (draid_debug) {
 		printf("Single: worst %6.3f mean %6.3f\n",
 		    eval_decluster(map, DRAIDCFG_EVAL_WORST, 1, 0),
 		    eval_decluster(map, DRAIDCFG_EVAL_MEAN, 1, 0));

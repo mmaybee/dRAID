@@ -116,14 +116,18 @@ device(s) failing before data integrity is compromised.
 The minimum number of devices in a draid is P+2.
 As a general rule the more devices included in the draid the faster it will
 be to rebuild to a distributed hot spare.
-.It Sy draid[<parity>][:<data><d|D>][:<spares><s|S>]
+.It Sy draid[<parity>][:<data><d|D>][:<children><c|C>][:<spares><s|S>]
 When a non-default draid configuration is required it can be specified by
-appending one or more of the following arguments to the
+appending one or more of the following optional arguments to the
 .Sy draid
 keyword.
 .Pp
+.Em children
+- The expected number of children.
+If the provided number of children is different an error is returned.
+.Pp
 .Em data
-- The number of data devices per group.
+- The number of data devices per redundancy group.
 .Pp
 .Em parity
 - The parity level as described above (1-3).

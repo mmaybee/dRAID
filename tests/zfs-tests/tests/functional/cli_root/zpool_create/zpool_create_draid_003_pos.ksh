@@ -32,7 +32,7 @@
 #
 # STRATEGY:
 # 1) Test valid stripe/spare combinations given the number of children.
-# 2) Test invalid stripe/spare combinations outside the allow limits.
+# 2) Test invalid stripe/spare/children combinations outside the allow limits.
 #
 
 verify_runnable "global"
@@ -45,7 +45,7 @@ function cleanup
 	rmdir $TESTDIR
 }
 
-log_assert "'zpool create <pool> draid:#d:#s <vdevs>'"
+log_assert "'zpool create <pool> draid:#d:#c:#s <vdevs>'"
 
 log_onexit cleanup
 
@@ -87,4 +87,10 @@ log_mustnot zpool create $TESTPOOL draid2:0d $draid_vdevs
 log_mustnot zpool create $TESTPOOL draid2:0s $draid_vdevs
 log_mustnot zpool create $TESTPOOL draid2:0s:0d $draid_vdevs
 
-log_pass "'zpool create <pool> draid:#d:#s <vdevs>'"
+# The required children argument is enforced.
+log_mustnot zpool create $TESTPOOL draid2:0c $draid_vdevs
+log_mustnot zpool create $TESTPOOL draid2:31c $draid_vdevs
+log_must zpool create $TESTPOOL draid2:32c $draid_vdevs
+destroy_pool $TESTPOOL
+
+log_pass "'zpool create <pool> draid:#d:#c:#s <vdevs>'"

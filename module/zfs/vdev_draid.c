@@ -230,7 +230,7 @@ vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff,
 	 * alignment. So, for example, if our slice size is 16MB, our group
 	 * size is 10, and there are 13 data drives in the draid, then ngroups
 	 * will be 13, we will change permutation every 2.08GB and each
-	 * disk will have 150MB of data per chunk.
+	 * disk will have 160MB of data per chunk.
 	 */
 	uint64_t ndata = vdc->vdc_data;
 	uint64_t groupsz = ndata + vdc->vdc_parity;
