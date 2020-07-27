@@ -5202,7 +5202,7 @@ zdb_blkptr_done(zio_t *zio)
 		    (u_longlong_t)zb->zb_level,
 		    (u_longlong_t)zb->zb_blkid,
 		    blkbuf);
-ASSERT(ioerr != ECKSUM);
+		ASSERT(ioerr != ECKSUM);
 	}
 	mutex_exit(&spa->spa_scrub_lock);
 

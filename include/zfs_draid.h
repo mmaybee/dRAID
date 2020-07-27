@@ -98,15 +98,16 @@ typedef enum {
 #define	DRAIDCFG_DEFAULT_FAULTS		1
 
 typedef struct vdev_draid_config {
-	uint64_t vdc_guid;
-	uint64_t vdc_groups;
-	uint64_t vdc_parity;
-	uint64_t vdc_spares;
-	uint64_t vdc_children;
-	uint64_t vdc_bases;
-	uint64_t vdc_data;
-	uint64_t *vdc_base_perms;
-	long int vdc_seed;
+	uint64_t vdc_guid;		/* unique identifier */
+	uint64_t vdc_groups;		/* # groups per slice */
+	uint64_t vdc_data;		/* # of data devices in group */
+	uint64_t vdc_parity;		/* # of parity devices in group */
+	uint64_t vdc_spares;		/* # of distributed spares */
+	uint64_t vdc_children;		/* # of children */
+	uint64_t vdc_groupsz;		/* group size ((data+parity)*slice) */
+	uint64_t vdc_bases;		/* # of rows in permutations */
+	uint64_t *vdc_base_perms;	/* base permutation array */
+	long int vdc_seed;		/* seed which generated permutations */
 } vdev_draid_config_t;
 
 /*
