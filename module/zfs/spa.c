@@ -5637,7 +5637,7 @@ spa_add_draid_spare(nvlist_t *nvroot, vdev_t *rvd)
 		vdev_t *c = rvd->vdev_child[i];
 
 		if (c->vdev_ops == &vdev_draid_ops) {
-			n += c->vdev_spares;
+			n += c->vdev_nspares;
 		}
 	}
 
@@ -5660,7 +5660,7 @@ spa_add_draid_spare(nvlist_t *nvroot, vdev_t *rvd)
 		if (c->vdev_ops != &vdev_draid_ops)
 			continue;
 
-		for (uint64_t j = 0; j < c->vdev_spares; j++) {
+		for (uint64_t j = 0; j < c->vdev_nspares; j++) {
 			nvlist_t *ds = fnvlist_alloc();
 			char path[64];
 

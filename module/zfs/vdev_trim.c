@@ -656,7 +656,7 @@ vdev_trim_calculate_progress(vdev_t *vd)
 			ms_free /= vd->vdev_top->vdev_children;
 		} else if (vd->vdev_top->vdev_ops == &vdev_draid_ops) {
 			ms_free /= (vd->vdev_top->vdev_children -
-			    vd->vdev_top->vdev_spares);
+			    vd->vdev_top->vdev_nspares);
 		}
 
 		/*

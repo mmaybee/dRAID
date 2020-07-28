@@ -136,7 +136,7 @@ vdev_draid_get_perm(vdev_draid_config_t *vdc, uint64_t pindex,
     uint64_t **base, uint64_t *iter)
 {
 	uint64_t ncols = vdc->vdc_children;
-	uint64_t poff = pindex % (vdc->vdc_bases * ncols);
+	uint64_t poff = pindex % (vdc->vdc_nbases * ncols);
 
 	*base = vdc->vdc_base_perms + (poff / ncols) * ncols;
 	*iter = poff % ncols;
@@ -306,7 +306,7 @@ vdev_draid_logical_to_physical(vdev_t *vd, uint64_t logical_offset,
 	 * disk will have 160MB of data per chunk.
 	 */
 	uint64_t groupwidth = vdc->vdc_groupwidth;
-	uint64_t ngroups = vdc->vdc_groups;
+	uint64_t ngroups = vdc->vdc_ngroups;
 	uint64_t ndisks = vdc->vdc_ndisks;
 
 	/*
@@ -374,20 +374,20 @@ vdev_draid_map_alloc(zio_t *zio)
 	 * "Quotient": The number of data sectors for this stripe on all but
 	 * the "big column" child vdevs that also contain "remainder" data.
 	 */
-	uint64_t q = psize / vdc->vdc_data;
+	uint64_t q = psize / vdc->vdc_ndata;
 
 	/*
 	 * "Remainder": The number of partial stripe data sectors in this I/O.
 	 * This will add a sector to some, but not all, child vdevs.
 	 */
-	uint64_t r = psize - q * vdc->vdc_data;
+	uint64_t r = psize - q * vdc->vdc_ndata;
 
 	/* The number of "big columns" - those which contain remainder data. */
-	uint64_t bc = (r == 0 ? 0 : r + vdc->vdc_parity);
+	uint64_t bc = (r == 0 ? 0 : r + vdc->vdc_nparity);
 	ASSERT3U(bc, <, groupwidth);
 
 	/* The total number of data and parity sectors for this I/O. */
-	uint64_t tot = psize + (vdc->vdc_parity * (q + (r == 0 ? 0 : 1)));
+	uint64_t tot = psize + (vdc->vdc_nparity * (q + (r == 0 ? 0 : 1)));
 
 	raidz_map_t *rm = kmem_alloc(offsetof(raidz_map_t, rm_col[groupwidth]),
 	    KM_SLEEP);
@@ -398,7 +398,7 @@ vdev_draid_map_alloc(zio_t *zio)
 	rm->rm_skipstart = bc;
 	rm->rm_missingdata = 0;
 	rm->rm_missingparity = 0;
-	rm->rm_firstdatacol = vdc->vdc_parity;
+	rm->rm_firstdatacol = vdc->vdc_nparity;
 	rm->rm_abd_copy = NULL;
 	rm->rm_abd_skip = NULL;
 	rm->rm_reports = 0;
@@ -440,7 +440,7 @@ vdev_draid_map_alloc(zio_t *zio)
 	rm->rm_nskip = roundup(tot, groupwidth) - tot;
 	IMPLY(bc > 0, rm->rm_nskip == groupwidth - bc);
 	ASSERT3U(rm->rm_asize - asize, ==, rm->rm_nskip << ashift);
-	ASSERT3U(rm->rm_nskip, <, vdc->vdc_data);
+	ASSERT3U(rm->rm_nskip, <, vdc->vdc_ndata);
 
 	/* Allocate buffers for the parity columns */
 	/* XXX - could we delay/avoid this on read until reconstruction? */
@@ -544,8 +544,8 @@ vdev_draid_asize(vdev_t *vd, uint64_t psize)
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	asize = roundup(asize, vdc->vdc_data);
-	asize += vdc->vdc_parity * (asize / vdc->vdc_data);
+	asize = roundup(asize, vdc->vdc_ndata);
+	asize += vdc->vdc_nparity * (asize / vdc->vdc_ndata);
 
 	ASSERT3U(asize, !=, 0);
 	ASSERT3U(asize, <, vdc->vdc_groupsz);
@@ -563,7 +563,7 @@ vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
-	return ((asize / vdc->vdc_groupwidth) * vdc->vdc_data);
+	return ((asize / vdc->vdc_groupwidth) * vdc->vdc_ndata);
 }
 
 /*
@@ -727,7 +727,7 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
 	uint64_t group = vdev_draid_offset_to_group(vd, offset);
-	uint64_t perm = group / vdc->vdc_groups;
+	uint64_t perm = group / vdc->vdc_ngroups;
 
 	uint64_t *base, iter;
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
@@ -758,10 +758,10 @@ vdev_draid_create_base_permutations(const uint8_t *perms,
     vdev_draid_config_t *vdc)
 {
 	uint64_t children = vdc->vdc_children, *base_perms;
-	size_t sz = sizeof (uint64_t) * vdc->vdc_bases * children;
+	size_t sz = sizeof (uint64_t) * vdc->vdc_nbases * children;
 
 	base_perms = kmem_alloc(sz, KM_SLEEP);
-	for (int i = 0; i < vdc->vdc_bases; i++)
+	for (int i = 0; i < vdc->vdc_nbases; i++)
 		for (int j = 0; j < children; j++)
 			base_perms[i * children + j] = perms[i * children + j];
 
@@ -793,18 +793,18 @@ vdev_draid_config_create(vdev_t *vd)
 	    ZPOOL_CONFIG_DRAIDCFG_GUID);
 	vdc->vdc_seed = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_SEED);
-	vdc->vdc_data = fnvlist_lookup_uint64(nvl,
+	vdc->vdc_ndata = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_DATA);
-	vdc->vdc_parity = fnvlist_lookup_uint64(nvl,
+	vdc->vdc_nparity = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_PARITY);
-	vdc->vdc_spares = fnvlist_lookup_uint64(nvl,
+	vdc->vdc_nspares = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_SPARES);
 	vdc->vdc_children = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_CHILDREN);
-	vdc->vdc_groups = fnvlist_lookup_uint64(nvl,
+	vdc->vdc_ngroups = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_GROUPS);
-	vdc->vdc_bases = fnvlist_lookup_uint64(nvl,
-	    ZPOOL_CONFIG_DRAIDCFG_BASE);
+	vdc->vdc_nbases = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_BASES);
 	VERIFY0(nvlist_lookup_uint8_array(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_PERM, &perms, &c));
 	vdc->vdc_base_perms = vdev_draid_create_base_permutations(perms, vdc);
@@ -812,17 +812,17 @@ vdev_draid_config_create(vdev_t *vd)
 	/*
 	 * Derived constants.
 	 */
-	vdc->vdc_groupwidth = vdc->vdc_data + vdc->vdc_parity;
-	vdc->vdc_ndisks = vdc->vdc_children - vdc->vdc_spares;
+	vdc->vdc_groupwidth = vdc->vdc_ndata + vdc->vdc_nparity;
+	vdc->vdc_ndisks = vdc->vdc_children - vdc->vdc_nspares;
 	vdc->vdc_groupsz = vdc->vdc_groupwidth * DRAID_ROWSIZE;
-	vdc->vdc_slicesz = vdc->vdc_groupsz * vdc->vdc_groups;
+	vdc->vdc_slicesz = vdc->vdc_groupsz * vdc->vdc_ngroups;
 
 	ASSERT3U(vdc->vdc_groupwidth, >=, 2);
 	ASSERT3U(vdc->vdc_ndisks, >=, 2);
 	ASSERT3U(vdc->vdc_groupsz, >=, 2 * DRAID_ROWSIZE);
 	ASSERT3U(vdc->vdc_slicesz, >=, 2 * DRAID_ROWSIZE);
 	ASSERT3U(vdc->vdc_slicesz % vdc->vdc_ndisks, ==, 0);
-	ASSERT3U((vdc->vdc_groupwidth * vdc->vdc_groups) %
+	ASSERT3U((vdc->vdc_groupwidth * vdc->vdc_ngroups) %
 	    vdc->vdc_ndisks, ==, 0);
 
 	return (vdc);
@@ -834,7 +834,7 @@ vdev_draid_config_create(vdev_t *vd)
 static void
 vdev_draid_config_destroy(vdev_draid_config_t *vdc)
 {
-	size_t sz = sizeof (uint64_t) * vdc->vdc_bases * vdc->vdc_children;
+	size_t sz = sizeof (uint64_t) * vdc->vdc_nbases * vdc->vdc_children;
 
 	kmem_free(vdc->vdc_base_perms, P2ROUNDUP(sz, PAGESIZE));
 	kmem_free(vdc, sizeof (*vdc));
@@ -942,8 +942,8 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 		 * asize even when the vdev_draid_config_t is not available
 		 * because the open fails below and the vdc is freed.
 		 */
-		vd->vdev_spares = vdc->vdc_spares;
-		vd->vdev_groups = vdc->vdc_groups;
+		vd->vdev_nspares = vdc->vdc_nspares;
+		vd->vdev_ngroups = vdc->vdc_ngroups;
 		vd->vdev_tsd = vdc;
 	}
 
@@ -967,8 +967,8 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 
 	vdev_draid_calculate_asize(vd, asize, max_asize, ashift);
 
-	*asize = *asize * (vd->vdev_children - vdc->vdc_spares);
-	*max_asize = *max_asize * (vd->vdev_children - vdc->vdc_spares);
+	*asize = *asize * (vd->vdev_children - vdc->vdc_nspares);
+	*max_asize = *max_asize * (vd->vdev_children - vdc->vdc_nspares);
 
 	return (0);
 }
@@ -988,8 +988,8 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t maxpsize)
 	 * than the maximum allowed block size.
 	 */
 	maxpsize >>= vd->vdev_ashift;
-	maxpsize /= vdc->vdc_data;
-	maxpsize *= vdc->vdc_data;
+	maxpsize /= vdc->vdc_ndata;
+	maxpsize *= vdc->vdc_ndata;
 	maxpsize <<= vd->vdev_ashift;
 
 	return (vdev_draid_asize(vd, maxpsize));
@@ -1001,15 +1001,15 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t maxpsize)
 static int
 vdev_draid_active_spares(vdev_t *vd)
 {
-	int spares = 0;
+	int nspares = 0;
 
 	if (vd->vdev_ops == &vdev_draid_spare_ops)
 		return (1);
 
 	for (int c = 0; c < vd->vdev_children; c++)
-		spares += vdev_draid_active_spares(vd->vdev_child[c]);
+		nspares += vdev_draid_active_spares(vd->vdev_child[c]);
 
-	return (spares);
+	return (nspares);
 }
 
 /*
@@ -1026,7 +1026,7 @@ vdev_draid_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t offset = DVA_GET_OFFSET(dva);
 
-	if (vdc->vdc_spares > 1 && vdev_draid_active_spares(vd) > 1)
+	if (vdc->vdc_nspares > 1 && vdev_draid_active_spares(vd) > 1)
 		return (B_TRUE);
 
 	if (!vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
@@ -1289,7 +1289,7 @@ vdev_ops_t vdev_draid_ops = {
  */
 typedef struct {
 	vdev_t *vds_draid_vdev;		/* top-level parent dRAID vdev */
-	uint64_t vds_spare_id;		/* spare id (0 - vdc->vdc_spares-1) */
+	uint64_t vds_spare_id;		/* spare id (0 - vdc->vdc_nspares-1) */
 } vdev_draid_spare_t;
 
 /*
@@ -1299,11 +1299,11 @@ typedef struct {
 vdev_t *
 vdev_draid_spare_get_parent(vdev_t *vd)
 {
-	uint64_t spare_id, parity, vdev_id;
+	uint64_t spare_id, nparity, vdev_id;
 	vdev_t *rvd = vd->vdev_spa->spa_root_vdev;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
-	if (vdev_draid_spare_values(vd->vdev_path, &spare_id, &parity,
+	if (vdev_draid_spare_values(vd->vdev_path, &spare_id, &nparity,
 	    &vdev_id) != 0) {
 		return (NULL);
 	}
@@ -1355,7 +1355,7 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t physical_offset)
 	vdev_draid_config_t *vdc = tvd->vdev_tsd;
 
 	ASSERT3P(tvd->vdev_ops, ==, &vdev_draid_ops);
-	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
+	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_nspares);
 
 	uint64_t *base, iter;
 	uint64_t perm = physical_offset / (vdc->vdc_slicesz / vdc->vdc_ndisks);
@@ -1397,7 +1397,7 @@ static int
 vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
     uint64_t *ashift)
 {
-	uint64_t spare_id, parity, vdev_id;
+	uint64_t spare_id, nparity, vdev_id;
 	uint64_t asize, max_asize;
 	vdev_draid_config_t *vdc;
 	vdev_draid_spare_t *vds;
@@ -1413,7 +1413,7 @@ vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	}
 
 	/* Extract dRAID configuration values from the provided vdev */
-	error = vdev_draid_spare_values(vd->vdev_path, &spare_id, &parity,
+	error = vdev_draid_spare_values(vd->vdev_path, &spare_id, &nparity,
 	    &vdev_id);
 	if (error)
 		return (error);
@@ -1429,7 +1429,7 @@ vdev_draid_spare_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 		return (SET_ERROR(EINVAL));
 
 	/* Spare name dRAID settings agree with top-level dRAID vdev */
-	if (vdc->vdc_parity != parity || vdc->vdc_spares <= spare_id)
+	if (vdc->vdc_nparity != nparity || vdc->vdc_nspares <= spare_id)
 		return (SET_ERROR(EINVAL));
 
 	vds = kmem_alloc(sizeof (vdev_draid_spare_t), KM_SLEEP);

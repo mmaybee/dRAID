@@ -299,7 +299,7 @@ vdev_get_min_asize(vdev_t *vd)
 
 	if (pvd->vdev_ops == &vdev_draid_ops) {
 		return (pvd->vdev_min_asize /
-		    (pvd->vdev_children - pvd->vdev_spares));
+		    (pvd->vdev_children - pvd->vdev_nspares));
 	}
 
 	return (pvd->vdev_min_asize);

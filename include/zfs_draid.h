@@ -103,8 +103,6 @@ typedef enum {
 
 /*
  * dRAID configuration.
- *
- * XXX - ndata, nparity, ndisks, etc?
  */
 typedef struct vdev_draid_config {
 	/*
@@ -112,12 +110,12 @@ typedef struct vdev_draid_config {
 	 */
 	uint64_t vdc_guid;		/* unique identifier */
 	long int vdc_seed;		/* seed which generated permutations */
-	uint64_t vdc_data;		/* # of data devices in group */
-	uint64_t vdc_parity;		/* # of parity devices in group */
-	uint64_t vdc_spares;		/* # of distributed spares */
+	uint64_t vdc_ndata;		/* # of data devices in group */
+	uint64_t vdc_nparity;		/* # of parity devices in group */
+	uint64_t vdc_nspares;		/* # of distributed spares */
 	uint64_t vdc_children;		/* # of children */
-	uint64_t vdc_groups;		/* # groups per slice */
-	uint64_t vdc_bases;		/* # of rows in permutations */
+	uint64_t vdc_ngroups;		/* # groups per slice */
+	uint64_t vdc_nbases;		/* # of rows in permutations */
 	uint64_t *vdc_base_perms;	/* base permutation array */
 
 	/*

@@ -102,7 +102,7 @@ vdev_draid_config_validate(nvlist_t *config,
 	}
 
 	/* Validate configuration base exists and is within range. */
-	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_BASE, &b))
+	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_BASES, &b))
 		return (DRAIDCFG_ERR_BASE_MISSING);
 
 	if (b == 0)
@@ -782,8 +782,8 @@ static int
 draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
     draidcfg_eval_t eval, int faults)
 {
-	int nspares = vdc->vdc_spares;
-	int ngroups = vdc->vdc_groups;
+	int nspares = vdc->vdc_nspares;
+	int ngroups = vdc->vdc_ngroups;
 	int ndevs = vdc->vdc_children;
 	uint64_t guid;
 	long int best_seed = 0;
@@ -887,7 +887,7 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
 		}
 
 		vdc->vdc_guid = guid;
-		vdc->vdc_bases = nrows;
+		vdc->vdc_nbases = nrows;
 		vdc->vdc_base_perms = perms;
 		vdc->vdc_seed = best_seed;
 
@@ -974,20 +974,20 @@ create_config(uint64_t data, uint64_t parity, uint64_t spares,
 	ASSERT3U(data + parity, <=, children - spares);
 
 	vdc = kmem_zalloc(sizeof (vdev_draid_config_t), KM_SLEEP);
-	vdc->vdc_groups = children - spares;
-	vdc->vdc_data = data;
-	vdc->vdc_parity = parity;
-	vdc->vdc_spares = spares;
+	vdc->vdc_ngroups = children - spares;
+	vdc->vdc_ndata = data;
+	vdc->vdc_nparity = parity;
+	vdc->vdc_nspares = spares;
 	vdc->vdc_children = children;
 
-	vdc->vdc_bases = 0;
+	vdc->vdc_nbases = 0;
 	vdc->vdc_base_perms = NULL;
 	if (draid_permutation_generate(vdc, passes, eval, faults) != 0) {
 		kmem_free(vdc, sizeof (vdev_draid_config_t));
 		return (NULL);
 	}
 
-	ASSERT3U(vdc->vdc_bases, !=, 0);
+	ASSERT3U(vdc->vdc_nbases, !=, 0);
 	ASSERT3P(vdc->vdc_base_perms, !=, NULL);
 
 	return (vdc);
@@ -997,7 +997,7 @@ static void
 free_config(vdev_draid_config_t *vdc)
 {
 	kmem_free((void *)vdc->vdc_base_perms,
-	    sizeof (uint64_t) * vdc->vdc_bases + vdc->vdc_children);
+	    sizeof (uint64_t) * vdc->vdc_nbases + vdc->vdc_children);
 	kmem_free(vdc, sizeof (*vdc));
 }
 
@@ -1116,10 +1116,10 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_SEED, vdc->vdc_seed);
 
 	/* Store the number of permutations followed by the permutations */
-	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_BASE, vdc->vdc_bases);
-	value = kmem_zalloc(children * vdc->vdc_bases * sizeof (uint8_t),
+	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_BASES, vdc->vdc_nbases);
+	value = kmem_zalloc(children * vdc->vdc_nbases * sizeof (uint8_t),
 	    KM_SLEEP);
-	for (int i = 0; i < vdc->vdc_bases; i++) {
+	for (int i = 0; i < vdc->vdc_nbases; i++) {
 		for (int j = 0; j < children; j++) {
 			uint64_t c = vdc->vdc_base_perms[i * children + j];
 			ASSERT3U(c, <, children);
@@ -1128,8 +1128,8 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 		}
 	}
 	fnvlist_add_uint8_array(cfg, ZPOOL_CONFIG_DRAIDCFG_PERM,
-	    value, children * vdc->vdc_bases);
-	kmem_free(value, children * vdc->vdc_bases * sizeof (uint8_t));
+	    value, children * vdc->vdc_nbases);
+	kmem_free(value, children * vdc->vdc_nbases * sizeof (uint8_t));
 
 	/*
 	 * Verify the generated configuration.  A failure indicates an
@@ -1400,11 +1400,11 @@ vdev_draid_config_print_error(draidcfg_err_t error)
 		break;
 	case DRAIDCFG_ERR_BASE_MISSING:
 		(void) fprintf(stderr, "Missing %s key in configuration\n",
-		    ZPOOL_CONFIG_DRAIDCFG_BASE);
+		    ZPOOL_CONFIG_DRAIDCFG_BASES);
 		break;
 	case DRAIDCFG_ERR_BASE_INVALID:
 		(void) fprintf(stderr, "Invalid %s value in configuration\n",
-		    ZPOOL_CONFIG_DRAIDCFG_BASE);
+		    ZPOOL_CONFIG_DRAIDCFG_BASES);
 		break;
 	case DRAIDCFG_ERR_PERM_MISSING:
 		(void) fprintf(stderr, "Missing %s key in configuration\n",

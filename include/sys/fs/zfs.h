@@ -766,7 +766,7 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_DRAIDCFG_SPARES	"draid_spares"
 #define	ZPOOL_CONFIG_DRAIDCFG_CHILDREN	"draid_children"
 #define	ZPOOL_CONFIG_DRAIDCFG_GROUPS	"draid_groups"
-#define	ZPOOL_CONFIG_DRAIDCFG_BASE	"draid_base"
+#define	ZPOOL_CONFIG_DRAIDCFG_BASES	"draid_bases"
 #define	ZPOOL_CONFIG_DRAIDCFG_PERM	"draid_perm"
 
 #define	VDEV_TYPE_ROOT			"root"

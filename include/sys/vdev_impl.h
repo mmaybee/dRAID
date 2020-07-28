@@ -258,8 +258,8 @@ struct vdev {
 	uint64_t	vdev_top_zap;
 	vdev_alloc_bias_t vdev_alloc_bias; /* metaslab allocation bias	*/
 	nvlist_t	*vdev_cfg;	/* dRAID configuration		*/
-	uint64_t	vdev_spares;	/* dRAID distributed spares	*/
-	uint64_t	vdev_groups;	/* dRAID groups			*/
+	uint64_t	vdev_nspares;	/* # dRAID distributed spares	*/
+	uint64_t	vdev_ngroups;	/* # dRAID groups		*/
 
 	/* pool checkpoint related */
 	space_map_t	*vdev_checkpoint_sm;	/* contains reserved blocks */
