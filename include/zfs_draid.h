@@ -98,8 +98,8 @@ typedef enum {
 #define	DRAIDCFG_DEFAULT_FAULTS		1
 
 /* Child vdev dRAID slice size */
-#define	DRAID_SLICESHIFT		SPA_MAXBLOCKSHIFT
-#define	DRAID_SLICESIZE			(1ULL << DRAID_SLICESHIFT)
+#define	DRAID_ROWSHIFT			SPA_MAXBLOCKSHIFT
+#define	DRAID_ROWSIZE			(1ULL << DRAID_ROWSHIFT)
 
 /*
  * dRAID configuration.

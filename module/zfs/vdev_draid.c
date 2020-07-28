@@ -280,27 +280,27 @@ vdev_draid_map_alloc_read(zio_t *zio, raidz_map_t *rm)
  * (at position 'start' in permutation number 'perm').
  */
 static uint64_t
-vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff,
+vdev_draid_logical_to_physical(vdev_t *vd, uint64_t logical_offset,
     uint64_t *perm, uint64_t *start)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
 	/* b is the dRAID (parent) sector offset. */
-	const uint64_t ashift = vd->vdev_top->vdev_ashift;
-	const uint64_t b = loff >> ashift;
+	uint64_t ashift = vd->vdev_top->vdev_ashift;
+	uint64_t b_offset = logical_offset >> ashift;
 
 	/*
-	 * The size of a SLICE in units of the vdev's minimum sector size.
-	 * SLICE is the amount of data written to each disk of each group
+	 * The size of a ROW in units of the vdev's minimum sector size.
+	 * ROW is the amount of data written to each disk of each group
 	 * in a given permutation.
 	 */
-	const uint64_t slice = DRAID_SLICESIZE >> ashift;
+	uint64_t blocks_per_row = DRAID_ROWSIZE >> ashift;
 
 	/*
 	 * We cycle through a disk permutation every groupsz * ngroups chunk
 	 * of address space. Note that ngroups * groupsz must be a multiple
 	 * of the number of data drives (ndisks) in order to guarantee
-	 * alignment. So, for example, if our slice size is 16MB, our group
+	 * alignment. So, for example, if our row size is 16MB, our group
 	 * size is 10, and there are 13 data drives in the draid, then ngroups
 	 * will be 13, we will change permutation every 2.08GB and each
 	 * disk will have 160MB of data per chunk.
@@ -313,14 +313,14 @@ vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff,
 	 * groupstart is where the group this IO will land in "starts" in
 	 * the permutation array.
 	 */
-	uint64_t group = b / (vdc->vdc_groupsz);
+	uint64_t group = logical_offset / vdc->vdc_groupsz;
 	uint64_t groupstart = (group * groupwidth) % ndisks;
 	ASSERT3U(groupstart + groupwidth, <=, ndisks + groupstart);
 	*start = groupstart;
 
-	/* offset is the sector offset within a group chunk */
-	uint64_t offset = b % (vdc->vdc_groupsz);
-	ASSERT0(offset % groupwidth);
+	/* b_offset is the sector offset within a group chunk */
+	b_offset = b_offset % (blocks_per_row * groupwidth);
+	ASSERT0(b_offset % groupwidth);
 
 	/*
 	 * Find the starting byte offset on each child vdev:
@@ -331,12 +331,10 @@ vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff,
 	 * - so we need to find the row where this IO group target begins
 	 */
 	*perm = group / ngroups;
-	uint64_t rows = (groupwidth * ngroups) / ndisks;
-	ASSERT0((groupwidth * ngroups) % ndisks);
-	uint64_t row = (*perm * rows) +
-	    ((group % ngroups) * groupwidth) / ndisks;
+	uint64_t row = (*perm * ((groupwidth * ngroups) / ndisks)) +
+	    (((group % ngroups) * groupwidth) / ndisks);
 
-	return (((slice * row) + (offset / groupwidth)) << ashift);
+	return (((blocks_per_row * row) + (b_offset / groupwidth)) << ashift);
 }
 
 /*
@@ -415,7 +413,7 @@ vdev_draid_map_alloc(zio_t *zio)
 
 		/* increment the offset if we wrap to the next row */
 		if (c == wrap)
-			physical_offset += DRAID_SLICESIZE;
+			physical_offset += DRAID_ROWSIZE;
 
 		rm->rm_col[c].rc_devidx =
 		    vdev_draid_permute_id(vdc, base, iter, i);
@@ -816,14 +814,16 @@ vdev_draid_config_create(vdev_t *vd)
 	 */
 	vdc->vdc_groupwidth = vdc->vdc_data + vdc->vdc_parity;
 	vdc->vdc_ndisks = vdc->vdc_children - vdc->vdc_spares;
-	vdc->vdc_groupsz = vdc->vdc_groupwidth * DRAID_SLICESIZE;
+	vdc->vdc_groupsz = vdc->vdc_groupwidth * DRAID_ROWSIZE;
 	vdc->vdc_slicesz = vdc->vdc_groupsz * vdc->vdc_groups;
 
 	ASSERT3U(vdc->vdc_groupwidth, >=, 2);
-	ASSERT3U(vdc->vdc_ndisks, >=, 3);
-	ASSERT3U(vdc->vdc_groupsz, >=, 2 * DRAID_SLICESIZE);
-	ASSERT3U(vdc->vdc_slicesz, >=, 2 * DRAID_SLICESIZE);
+	ASSERT3U(vdc->vdc_ndisks, >=, 2);
+	ASSERT3U(vdc->vdc_groupsz, >=, 2 * DRAID_ROWSIZE);
+	ASSERT3U(vdc->vdc_slicesz, >=, 2 * DRAID_ROWSIZE);
 	ASSERT3U(vdc->vdc_slicesz % vdc->vdc_ndisks, ==, 0);
+	ASSERT3U((vdc->vdc_groupwidth * vdc->vdc_groups) %
+	    vdc->vdc_ndisks, ==, 0);
 
 	return (vdc);
 }
@@ -1237,7 +1237,7 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 
 		if (c == 0 && i != 0) {
 			/* the group wrapped, increment the start */
-			start += DRAID_SLICESIZE;
+			start += DRAID_ROWSIZE;
 			end = start;
 		}
 
@@ -1553,8 +1553,8 @@ vdev_draid_spare_io_start(zio_t *zio)
 	}
 
 	/* Distributed spare IO never crosses a slice boundary. */
-	IMPLY(zio->io_type != ZIO_TYPE_IOCTL, offset >> DRAID_SLICESHIFT ==
-	    (offset + zio->io_size - 1) >> DRAID_SLICESHIFT);
+	IMPLY(zio->io_type != ZIO_TYPE_IOCTL, offset >> DRAID_ROWSHIFT ==
+	    (offset + zio->io_size - 1) >> DRAID_ROWSHIFT);
 
 	switch (zio->io_type) {
 	case ZIO_TYPE_IOCTL:
