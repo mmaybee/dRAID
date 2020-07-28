@@ -4514,24 +4514,10 @@ zio_done(zio_t *zio)
 		while (zio->io_cksum_report != NULL) {
 			zio_cksum_report_t *zcr = zio->io_cksum_report;
 			uint64_t align = zcr->zcr_align;
-			uint64_t asize = roundup(psize, align);
+			uint64_t asize = P2ROUNDUP(psize, align);
 			abd_t *adata = zio->io_abd;
 
-			/*
-			 * XXX - zcr_align is useless for draid, since the
-			 * value includes the parity, so, rather than just
-			 * round up the buffer size to a multiple of align,
-			 * we will just add align to the buffer and this
-			 * should guarantee that the buffer is big enough.
-			 *
 			if (asize != psize) {
-				adata = abd_alloc(asize, B_TRUE);
-				abd_copy(adata, zio->io_abd, psize);
-				abd_zero_off(adata, psize, asize - psize);
-			}
-			 */
-			if (align > 0) {
-				asize = psize + align;
 				adata = abd_alloc(asize, B_TRUE);
 				abd_copy(adata, zio->io_abd, psize);
 				abd_zero_off(adata, psize, asize - psize);
