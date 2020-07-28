@@ -7911,7 +7911,7 @@ zdb_read_block(char *thing, spa_t *spa)
 	DVA_SET_VDEV(&dva[0], vd->vdev_id);
 	DVA_SET_OFFSET(&dva[0], offset);
 	DVA_SET_GANG(&dva[0], !!(flags & ZDB_FLAG_GBH));
-	DVA_SET_ASIZE(&dva[0], vdev_psize_to_asize(vd, offset, psize));
+	DVA_SET_ASIZE(&dva[0], vdev_psize_to_asize(vd, psize));
 
 	BP_SET_BIRTH(bp, TXG_INITIAL, TXG_INITIAL);
 

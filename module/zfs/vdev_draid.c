@@ -498,7 +498,7 @@ vdev_draid_map_include_skip_sectors(zio_t *zio)
  * Converts a logical offset to the corresponding group number.
  */
 uint64_t
-vdev_draid_offset_to_group(const vdev_t *vd, uint64_t offset)
+vdev_draid_offset_to_group(vdev_t *vd, uint64_t offset)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
@@ -511,7 +511,7 @@ vdev_draid_offset_to_group(const vdev_t *vd, uint64_t offset)
  * Converts a group number to the logical starting offset for that group.
  */
 uint64_t
-vdev_draid_group_to_offset(const vdev_t *vd, uint64_t group)
+vdev_draid_group_to_offset(vdev_t *vd, uint64_t group)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
@@ -524,7 +524,7 @@ vdev_draid_group_to_offset(const vdev_t *vd, uint64_t group)
  * Given a offset into a draid, compute a group aligned offset.
  */
 uint64_t
-vdev_draid_get_astart(const vdev_t *vd, const uint64_t start)
+vdev_draid_get_astart(vdev_t *vd, const uint64_t start)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
@@ -534,11 +534,11 @@ vdev_draid_get_astart(const vdev_t *vd, const uint64_t start)
 }
 
 /*
- * dRAID asize is psize rounded up to a full group stripe multiple
- * plus parity.
+ * Return the asize which is the psize rounded up to a full group width.
+ * i.e. vdev_draid_psize_to_asize().
  */
 static uint64_t
-vdev_draid_psize_to_asize(const vdev_t *vd, uint64_t psize)
+vdev_draid_asize(vdev_t *vd, uint64_t psize)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t ashift = vd->vdev_ashift;
@@ -554,17 +554,6 @@ vdev_draid_psize_to_asize(const vdev_t *vd, uint64_t psize)
 	ASSERT3U(asize % (vdc->vdc_groupwidth), ==, 0);
 
 	return (asize << ashift);
-}
-
-/*
- * XXX - There's no longer any need to pass in an offset.  We should be able
- * to go back and restore this callback to its original prototype and all
- * modified callers.
- */
-static uint64_t
-vdev_draid_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
-{
-	return (vdev_draid_psize_to_asize(vd, psize));
 }
 
 /*
@@ -586,10 +575,10 @@ vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
  * next group if there wasn't space in the original group.
  */
 uint64_t
-vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
+vdev_draid_check_block(vdev_t *vd, uint64_t start, uint64_t *asizep)
 {
 	uint64_t group = vdev_draid_offset_to_group(vd, start);
-	uint64_t asize = vdev_draid_psize_to_asize(vd, *asizep);
+	uint64_t asize = vdev_draid_asize(vd, *asizep);
 	uint64_t end = start + asize - 1;
 
 	/* An allocation may not span metaslabs. */
@@ -606,7 +595,7 @@ vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
 	/* Advance to the next group. */
 	group++;
 	start = vdev_draid_group_to_offset(vd, group);
-	asize = vdev_draid_psize_to_asize(vd, *asizep);
+	asize = vdev_draid_asize(vd, *asizep);
 	end = start + asize - 1;
 
 	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, end));
@@ -714,7 +703,7 @@ vdev_draid_find_spare(vdev_t *vd)
 }
 
 static boolean_t
-vdev_draid_vd_degraded(vdev_t *vd, const vdev_t *fault_vdev, uint64_t offset)
+vdev_draid_vd_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset)
 {
 	/* Resilver */
 	if (fault_vdev == NULL)
@@ -768,7 +757,7 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
  */
 static uint64_t *
 vdev_draid_create_base_permutations(const uint8_t *perms,
-    const vdev_draid_config_t *vdc)
+    vdev_draid_config_t *vdc)
 {
 	uint64_t children = vdc->vdc_children, *base_perms;
 	size_t sz = sizeof (uint64_t) * vdc->vdc_bases * children;
@@ -1003,7 +992,7 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t maxpsize)
 	maxpsize *= vdc->vdc_data;
 	maxpsize <<= vd->vdev_ashift;
 
-	return (vdev_draid_psize_to_asize(vd, maxpsize));
+	return (vdev_draid_asize(vd, maxpsize));
 }
 
 /*
@@ -1055,7 +1044,7 @@ vdev_draid_io_verify(zio_t *zio, raidz_map_t *rm, int col)
 	range_seg64_t logical_rs, physical_rs, remain_rs;
 	logical_rs.rs_start = zio->io_offset;
 	logical_rs.rs_end = logical_rs.rs_start +
-	    vdev_draid_asize(zio->io_vd, zio->io_offset, zio->io_size);
+	    vdev_draid_asize(zio->io_vd, zio->io_size);
 
 	raidz_col_t *rc = &rm->rm_col[col];
 	vdev_t *cvd = vd->vdev_child[rc->rc_devidx];

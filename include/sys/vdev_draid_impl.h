@@ -40,10 +40,10 @@ extern "C" {
 
 extern boolean_t vdev_draid_group_degraded(vdev_t *, vdev_t *, uint64_t,
     uint64_t);
-extern uint64_t vdev_draid_check_block(const vdev_t *, uint64_t, uint64_t *);
-extern uint64_t vdev_draid_get_astart(const vdev_t *, const uint64_t);
-extern uint64_t vdev_draid_offset_to_group(const vdev_t *, uint64_t);
-extern uint64_t vdev_draid_group_to_offset(const vdev_t *, uint64_t);
+extern uint64_t vdev_draid_check_block(vdev_t *, uint64_t, uint64_t *);
+extern uint64_t vdev_draid_get_astart(vdev_t *, uint64_t);
+extern uint64_t vdev_draid_offset_to_group(vdev_t *, uint64_t);
+extern uint64_t vdev_draid_group_to_offset(vdev_t *, uint64_t);
 extern boolean_t vdev_draid_readable(vdev_t *, uint64_t);
 extern boolean_t vdev_draid_is_dead(vdev_t *, uint64_t);
 extern boolean_t vdev_draid_missing(vdev_t *, uint64_t, uint64_t, uint64_t);

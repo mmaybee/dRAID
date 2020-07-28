@@ -719,7 +719,7 @@ vdev_rebuild_chunk_size(vdev_t *vd, uint64_t start, uint64_t size)
 		    vd->vdev_ops == &vdev_replacing_ops ||
 		    vd->vdev_ops == &vdev_spare_ops);
 
-		max_asize = vdev_psize_to_asize(vd, start, max_segment);
+		max_asize = vdev_psize_to_asize(vd, max_segment);
 		chunk_size = MIN(size, max_asize);
 	}
 

@@ -251,13 +251,13 @@ vdev_derive_alloc_bias(const char *bias)
  * all children.  This is what's used by anything other than RAID-Z.
  */
 uint64_t
-vdev_default_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
+vdev_default_asize(vdev_t *vd, uint64_t psize)
 {
 	uint64_t asize = P2ROUNDUP(psize, 1ULL << vd->vdev_top->vdev_ashift);
 	uint64_t csize;
 
 	for (int c = 0; c < vd->vdev_children; c++) {
-		csize = vdev_psize_to_asize(vd->vdev_child[c], offset, psize);
+		csize = vdev_psize_to_asize(vd->vdev_child[c], psize);
 		asize = MAX(asize, csize);
 	}
 
@@ -1728,7 +1728,7 @@ vdev_set_deflate_ratio(vdev_t *vd)
 {
 	if (vd == vd->vdev_top && !vd->vdev_ishole && vd->vdev_ashift != 0) {
 		vd->vdev_deflate_ratio = (1 << 17) /
-		    (vdev_psize_to_asize(vd, -1, 1 << 17) >> SPA_MINBLOCKSHIFT);
+		    (vdev_psize_to_asize(vd, 1 << 17) >> SPA_MINBLOCKSHIFT);
 	}
 }
 
@@ -3521,9 +3521,9 @@ vdev_sync(vdev_t *vd, uint64_t txg)
 }
 
 uint64_t
-vdev_psize_to_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
+vdev_psize_to_asize(vdev_t *vd, uint64_t psize)
 {
-	return (vd->vdev_ops->vdev_op_asize(vd, offset, psize));
+	return (vd->vdev_ops->vdev_op_asize(vd, psize));
 }
 
 /*

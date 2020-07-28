@@ -5255,7 +5255,7 @@ top:
 		 * return an "estimate" for asize, which will be refined in
 		 * metaslab_group_alloc().
 		 */
-		uint64_t asize = vdev_psize_to_asize(vd, -1, psize);
+		uint64_t asize = vdev_psize_to_asize(vd, psize);
 
 		/*
 		 * If we don't need to try hard, then require that the
@@ -5602,7 +5602,7 @@ metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 	ASSERT3P(vd->vdev_indirect_mapping, ==, NULL);
 
 	if (DVA_GET_GANG(dva))
-		size = vdev_psize_to_asize(vd, offset, SPA_GANGBLOCKSIZE);
+		size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE);
 
 	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
 
@@ -5637,7 +5637,7 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva, boolean_t checkpoint)
 	ASSERT3U(spa_config_held(spa, SCL_ALL, RW_READER), !=, 0);
 
 	if (DVA_GET_GANG(dva)) {
-		size = vdev_psize_to_asize(vd, offset, SPA_GANGBLOCKSIZE);
+		size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE);
 	}
 
 	metaslab_free_impl(vd, offset, size, checkpoint);
@@ -5829,7 +5829,7 @@ metaslab_claim_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 	ASSERT(DVA_IS_VALID(dva));
 
 	if (DVA_GET_GANG(dva))
-		size = vdev_psize_to_asize(vd, offset, SPA_GANGBLOCKSIZE);
+		size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE);
 
 	return (metaslab_claim_impl(vd, offset, size, txg));
 }
@@ -6095,8 +6095,7 @@ metaslab_check_free(spa_t *spa, const blkptr_t *bp)
 		uint64_t size = DVA_GET_ASIZE(&bp->blk_dva[i]);
 
 		if (DVA_GET_GANG(&bp->blk_dva[i]))
-			size = vdev_psize_to_asize(vd, offset,
-			    SPA_GANGBLOCKSIZE);
+			size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE);
 
 		ASSERT3P(vd, !=, NULL);
 
