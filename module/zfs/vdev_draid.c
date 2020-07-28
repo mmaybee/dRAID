@@ -42,29 +42,44 @@
 #endif
 
 /*
- * dRAID is a distributed parity implementation for ZFS.
+ * dRAID is a distributed parity implementation for ZFS. A dRAID vdev is
+ * comprised of multiple raidz redundancy groups which are spread over the
+ * dRAID children. To ensure an even distribution, and avoid hot spots, a
+ * permutation mapping is applied to the order of the dRAID children.
+ * This mixing effectively distributes the parity columns evenly over all
+ * of the disks in the dRAID.
  *
- * XXX - add explanation about how the devices are permuted and a
- * justification for the dRAID functionality.
+ * This is beneficial because it means when resilvering all of the disks
+ * can participate thereby increasing the available IOPs and bandwidth.
+ * Furthermore, by reserving a small fraction of each child's total capacity
+ * virtual distributed spare disks can be created. These spares similarly
+ * benefit from the performance gains of spanning all of the children. The
+ * consequence of which is that resilvering to a distributed spare can
+ * substantially reduce the time required to restore full parity to pool
+ * with a failed disks.
  *
- * dRAID group layout:
+ * === dRAID group layout ===
  *
- * First, let's define a "row" in the config to be a 16M chunk from each
- * physical drive at the same offset.  Furthermore, a "group" is a set of
- * sequential drives from a row which contain both parity and data. We
- * allow groups to span multiple rows in order to align any group size to
- * any number of physical drives.
+ * First, let's define a "row" in the configuration to be a 16M chunk from
+ * each physical drive at the same offset. This is the minimum allowable
+ * size since it must be possible to store a full 16M block when there is
+ * only a single data column. Next, we defined a "group" to be a set of
+ * sequential disks containing both the parity and data columns. We allow
+ * groups to span multiple rows in order to align any group size to any
+ * number of physical drives. Finally, a "slice" is comprised of the rows
+ * which contains the target number of groups. The permutation mappings
+ * are applied in a round robin fashion to each slice.
  *
  * Given n drives in a group (including parity drives) and m physical drives
- * (not including the spare drives), if we distribute the groups across n
- * rows, we will always end up with m groups distributed across the n rows
- * with no remainder. In this type of configuration the slice size becomes
- * n * row size.
+ * (not including the spare drives), we can distribute the groups across r
+ * rows without remainder by selecting the least common multiple of n and m
+ * as the number groups; i.e. ngroups = LCM(n, m).
  *
- * In the example below, there are 17 physical drives in the config, with
- * two drives worth of spare capacity. The group size is 8, there are 15
- * groups and 8 rows per group.  If the row chunk size is 16M, the slice
+ * In the example below, there are 17 physical drives in the configuration,
+ * with two drives worth of spare capacity. The group size is 8, there are
+ * 15 groups and 8 rows per group. If the row chunk size is 16M, the slice
  * chunk size will be 128M.
+ *
  *
  *                              data disks                         spares
  *    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
@@ -90,6 +105,13 @@
  *    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
  *
  *    ...
+ *
+ * Notes:
+ * 1. In this configuration the number of groups equals the number of data
+ *    disks. This will occur but it should never be depended upon.
+ *
+ * 2. The top row of values (5, 11, 7, ...) reflects an example disk
+ *    permutation mapping which has been applied to the slice.
  *
  * This layout has several advantages:
  *
@@ -410,16 +432,6 @@ vdev_draid_map_alloc(zio_t *zio)
 		rm->rm_col[c].rc_tried = 0;
 		rm->rm_col[c].rc_skipped = 0;
 		rm->rm_col[c].rc_repair = 0;
-
-#if 0
-		/* resolve dspare to actual leaf child */
-		vdev_t *cvd = vd->vdev_child[rm->rm_col[c].rc_devidx];
-		if (cvd->vdev_ops == &vdev_draid_spare_ops) {
-			cvd = vdev_draid_spare_get_child(cvd, o);
-			ASSERT3P(cvd->vdev_parent, ==, vd);
-			rm->rm_col[c].rc_devidx = cvd->vdev_id;
-		}
-#endif
 
 		if (c >= rm->rm_cols)
 			rm->rm_col[c].rc_size = 0;
