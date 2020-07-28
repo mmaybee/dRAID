@@ -705,8 +705,7 @@ vdev_rebuild_chunk_size(vdev_t *vd, uint64_t start, uint64_t size)
 	if (vd->vdev_ops == &vdev_draid_ops) {
 		uint64_t group, left;
 
-		max_asize = vdev_draid_max_rebuildable_asize(vd, start,
-		    max_segment);
+		max_asize = vdev_draid_max_rebuildable_asize(vd, max_segment);
 		chunk_size = MIN(size, max_asize);
 
 		group = vdev_draid_offset_to_group(vd, start);

@@ -3844,9 +3844,7 @@ zio_vdev_io_done(zio_t *zio)
 	}
 
 	ops->vdev_op_io_done(zio);
-#if 0
-ASSERT(zio->io_error != ECKSUM || (zio->io_flags & ZIO_FLAG_SPECULATIVE));
-#endif
+
 	if (unexpected_error)
 		VERIFY(vdev_probe(vd, zio) == NULL);
 

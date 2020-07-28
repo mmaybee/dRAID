@@ -84,24 +84,24 @@
  *                              data disks                         spares
  *    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
  *    | 5 | 11| 7 | 13| 6 | 9 | 12| 1 | 4 | 2 | 0 | 10| 15| 8 | 3 | 14| 16|
- * s  |         group 1               |          group 2          |       |
- * l  |   |           group 3             |        group 4        |       |
- * i  |       |           group 5             |        group 6    |       |
- * c  |           |           group 7             |        group 8|       |
- * e  |               |           group 9             |           |       |
- * 1  |  group 10         |           group 11            |       |       |
- *    |      group 12         |           group 13            |   |       |
- *    |          group 14         |           group 15            |       |
+ * s  |         group 0               |          group 1          |       |
+ * l  |   |           group 2             |        group 3        |       |
+ * i  |       |           group 4             |        group 5    |       |
+ * c  |           |           group 6             |        group 7|       |
+ * e  |               |           group 8             |           |       |
+ * 1  |  group 9          |           group 10            |       |       |
+ *    |      group 11         |           group 12            |   |       |
+ *    |          group 13         |           group 14            |       |
  *    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
  *    | 6 | 12| 8 | 14| 7 | 10| 13| 2 | 5 | 3 | 1 | 11| 16| 9 | 4 | 15| 0 |
- * s  |         group 1               |          group 2          |       |
- * l  |   |           group 3             |        group 4        |       |
- * i  |       |           group 5             |        group 6    |       |
- * c  |           |           group 7             |        group 8|       |
- * e  |               |           group 9             |           |       |
- * 2  |  group 10         |           group 11            |       |       |
- *    |      group 12         |           group 13            |   |       |
- *    |          group 14         |           group 15            |       |
+ * s  |         group 15              |          group 16         |       |
+ * l  |   |           group 17            |        group 18       |       |
+ * i  |       |           group 19            |        group 20   |       |
+ * c  |           |           group 21            |       group 22|       |
+ * e  |               |           group 23            |           |       |
+ * 2  |  group 24         |           group 25            |       |       |
+ *    |      group 26         |           group 27            |   |       |
+ *    |          group 28         |           group 29            |       |
  *    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
  *
  *    ...
@@ -126,7 +126,6 @@
  *    permutation numbers and drive offsets is more complicated).
  */
 
-static uint64_t vdev_draid_psize_to_asize(const vdev_t *, uint64_t, uint64_t);
 static vdev_t *vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset);
 
 /*
@@ -531,7 +530,53 @@ vdev_draid_get_astart(const vdev_t *vd, const uint64_t start)
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	return (roundup(start, (vdc->vdc_groupwidth) << vd->vdev_ashift));
+	return (roundup(start, vdc->vdc_groupwidth << vd->vdev_ashift));
+}
+
+/*
+ * dRAID asize is psize rounded up to a full group stripe multiple
+ * plus parity.
+ */
+static uint64_t
+vdev_draid_psize_to_asize(const vdev_t *vd, uint64_t psize)
+{
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
+	uint64_t ashift = vd->vdev_ashift;
+	uint64_t asize = ((psize - 1) >> ashift) + 1;
+
+	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
+
+	asize = roundup(asize, vdc->vdc_data);
+	asize += vdc->vdc_parity * (asize / vdc->vdc_data);
+
+	ASSERT3U(asize, !=, 0);
+	ASSERT3U(asize, <, vdc->vdc_groupsz);
+	ASSERT3U(asize % (vdc->vdc_groupwidth), ==, 0);
+
+	return (asize << ashift);
+}
+
+/*
+ * XXX - There's no longer any need to pass in an offset.  We should be able
+ * to go back and restore this callback to its original prototype and all
+ * modified callers.
+ */
+static uint64_t
+vdev_draid_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
+{
+	return (vdev_draid_psize_to_asize(vd, psize));
+}
+
+/*
+ * Deflate the asize to the psize for a block at the provided offset.
+ * This involves stripping parity.
+ */
+uint64_t
+vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
+{
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
+
+	return ((asize / vdc->vdc_groupwidth) * vdc->vdc_data);
 }
 
 /*
@@ -544,7 +589,7 @@ uint64_t
 vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
 {
 	uint64_t group = vdev_draid_offset_to_group(vd, start);
-	uint64_t asize = vdev_draid_psize_to_asize(vd, start, *asizep);
+	uint64_t asize = vdev_draid_psize_to_asize(vd, *asizep);
 	uint64_t end = start + asize - 1;
 
 	/* An allocation may not span metaslabs. */
@@ -561,7 +606,7 @@ vdev_draid_check_block(const vdev_t *vd, uint64_t start, uint64_t *asizep)
 	/* Advance to the next group. */
 	group++;
 	start = vdev_draid_group_to_offset(vd, group);
-	asize = vdev_draid_psize_to_asize(vd, start, *asizep);
+	asize = vdev_draid_psize_to_asize(vd, *asizep);
 	end = start + asize - 1;
 
 	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, end));
@@ -940,53 +985,12 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 }
 
 /*
- * dRAID asize is psize rounded up to a full group stripe multiple
- * plus parity.
- */
-static uint64_t
-vdev_draid_psize_to_asize(const vdev_t *vd, uint64_t offset, uint64_t psize)
-{
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t asize = ((psize - 1) >> ashift) + 1;
-
-	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
-
-	asize = roundup(asize, vdc->vdc_data);
-	asize += vdc->vdc_parity * (asize / vdc->vdc_data);
-
-	ASSERT0(asize % (vdc->vdc_groupwidth));
-	ASSERT(asize != 0);
-
-	return (asize << ashift);
-}
-
-static uint64_t
-vdev_draid_asize(vdev_t *vd, uint64_t offset, uint64_t psize)
-{
-	return (vdev_draid_psize_to_asize(vd, offset, psize));
-}
-
-/*
- * Deflate the asize to the psize for a block at the provided offset.
- * This involves stripping parity.
- */
-uint64_t
-vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
-{
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
-
-	return ((asize / vdc->vdc_groupwidth) * vdc->vdc_data);
-}
-
-/*
  * Return the asize of the largest block which can be reconstructed.
  */
 uint64_t
-vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
+vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t maxpsize)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t ashift = vd->vdev_top->vdev_ashift;
 
 	/*
 	 * When the maxpsize >> ashift does not divide evenly by the number
@@ -994,12 +998,12 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 	 * sectors will cause vdev_draid_asize_to_psize() to get a psize larger
 	 * than the maximum allowed block size.
 	 */
-	maxpsize >>= ashift;
+	maxpsize >>= vd->vdev_ashift;
 	maxpsize /= vdc->vdc_data;
 	maxpsize *= vdc->vdc_data;
-	maxpsize <<= ashift;
+	maxpsize <<= vd->vdev_ashift;
 
-	return (vdev_draid_psize_to_asize(vd, offset, maxpsize));
+	return (vdev_draid_psize_to_asize(vd, maxpsize));
 }
 
 /*
@@ -1239,23 +1243,22 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 	 * Otherwise, leave them unmodified which will result in an empty
 	 * (zero-length) physical range being returned.
 	 */
-	uint64_t groupwidth = vdc->vdc_data + vdc->vdc_parity;
-	uint64_t ndisks = vdc->vdc_children - vdc->vdc_spares;
-	for (uint64_t i = 0; i < groupwidth; i++) {
-		uint64_t c = (groupstart + i) % ndisks;
+	for (uint64_t i = 0; i < vdc->vdc_groupwidth; i++) {
+		uint64_t c = (groupstart + i) % vdc->vdc_ndisks;
 
 		if (c == 0 && i != 0) {
 			/* the group wrapped, increment the start */
 			start += DRAID_SLICESIZE;
 			end = start;
 		}
+
 		id = vdev_draid_permute_id(vdc, base, iter, c);
 		if (id == cvd->vdev_id) {
 			uint64_t b_size = (in->rs_end >> ashift) -
 			    (in->rs_start >> ashift);
 			ASSERT3U(b_size, >, 0);
 			end = start + ((((b_size - 1) /
-			    groupwidth) + 1) << ashift);
+			    vdc->vdc_groupwidth) + 1) << ashift);
 			break;
 		}
 	}

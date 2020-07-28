@@ -48,7 +48,7 @@ extern boolean_t vdev_draid_readable(vdev_t *, uint64_t);
 extern boolean_t vdev_draid_is_dead(vdev_t *, uint64_t);
 extern boolean_t vdev_draid_missing(vdev_t *, uint64_t, uint64_t, uint64_t);
 extern uint64_t vdev_draid_asize_to_psize(vdev_t *, uint64_t, uint64_t);
-extern uint64_t vdev_draid_max_rebuildable_asize(vdev_t *, uint64_t, uint64_t);
+extern uint64_t vdev_draid_max_rebuildable_asize(vdev_t *, uint64_t);
 extern void vdev_draid_map_include_skip_sectors(zio_t *);
 extern nvlist_t *vdev_draid_read_config_spare(vdev_t *);
 
