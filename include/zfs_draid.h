@@ -97,18 +97,38 @@ typedef enum {
  */
 #define	DRAIDCFG_DEFAULT_FAULTS		1
 
+/* Child vdev dRAID slice size */
+#define	DRAID_SLICESHIFT		SPA_MAXBLOCKSHIFT
+#define	DRAID_SLICESIZE			(1ULL << DRAID_SLICESHIFT)
+
+/*
+ * dRAID configuration.
+ *
+ * XXX - ndata, nparity, ndisks, etc?
+ */
 typedef struct vdev_draid_config {
+	/*
+	 * Values read from the ZPOOL_CONFIG_DRAIDCFG nvlist.
+	 */
 	uint64_t vdc_guid;		/* unique identifier */
-	uint64_t vdc_groups;		/* # groups per slice */
+	long int vdc_seed;		/* seed which generated permutations */
 	uint64_t vdc_data;		/* # of data devices in group */
 	uint64_t vdc_parity;		/* # of parity devices in group */
 	uint64_t vdc_spares;		/* # of distributed spares */
 	uint64_t vdc_children;		/* # of children */
-	uint64_t vdc_groupsz;		/* group size ((data+parity)*slice) */
+	uint64_t vdc_groups;		/* # groups per slice */
 	uint64_t vdc_bases;		/* # of rows in permutations */
 	uint64_t *vdc_base_perms;	/* base permutation array */
-	long int vdc_seed;		/* seed which generated permutations */
+
+	/*
+	 * Immutable derived constants.
+	 */
+	uint64_t vdc_groupwidth;	/* = vdc_data + vdc_parity */
+	uint64_t vdc_ndisks;		/* = vdc_children - vdc_spares */
+	uint64_t vdc_groupsz;		/* = vdc_groupwidth * DRAID_SLICESIZE */
+	uint64_t vdc_slicesz;		/* = vdc_groupsz * vdc_groups */
 } vdev_draid_config_t;
+
 
 /*
  * Errors which may be returned when validating a dRAID configuration.

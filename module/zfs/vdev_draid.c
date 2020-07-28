@@ -129,10 +129,6 @@
 static uint64_t vdev_draid_psize_to_asize(const vdev_t *, uint64_t, uint64_t);
 static vdev_t *vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset);
 
-/* A child vdev is divided into slices */
-#define	DRAID_SLICESHIFT	SPA_MAXBLOCKSHIFT
-#define	DRAID_SLICESIZE		(1ULL << DRAID_SLICESHIFT)
-
 /*
  * Lookup the permutation base array and iteration id for the provided offset.
  */
@@ -310,11 +306,9 @@ vdev_draid_logical_to_physical(vdev_t *vd, uint64_t loff,
 	 * will be 13, we will change permutation every 2.08GB and each
 	 * disk will have 160MB of data per chunk.
 	 */
-	uint64_t ndata = vdc->vdc_data;
-	uint64_t groupwidth = ndata + vdc->vdc_parity;
+	uint64_t groupwidth = vdc->vdc_groupwidth;
 	uint64_t ngroups = vdc->vdc_groups;
-	uint64_t ndisks = vdc->vdc_children - vdc->vdc_spares;
-	ASSERT3U(groupwidth, >, 0);
+	uint64_t ndisks = vdc->vdc_ndisks;
 
 	/*
 	 * groupstart is where the group this IO will land in "starts" in
@@ -359,8 +353,8 @@ vdev_draid_map_alloc(zio_t *zio)
 
 	/* Lookup starting byte offset on each child vdev */
 	uint64_t groupstart, perm;
-	uint64_t o = vdev_draid_logical_to_physical(vd, zio->io_offset,
-	    &perm, &groupstart);
+	uint64_t physical_offset = vdev_draid_logical_to_physical(vd,
+	    zio->io_offset, &perm, &groupstart);
 
 	/*
 	 * If there is less than groupwidth drives available after the group
@@ -368,9 +362,10 @@ vdev_draid_map_alloc(zio_t *zio)
 	 * group disk number that starts on the next row.
 	 */
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t ndisks = vdc->vdc_children - vdc->vdc_spares;
-	uint64_t groupwidth = vdc->vdc_data + vdc->vdc_parity;
+	uint64_t ndisks = vdc->vdc_ndisks;
+	uint64_t groupwidth = vdc->vdc_groupwidth;
 	uint64_t wrap = groupwidth;
+
 	if (groupstart + groupwidth > ndisks)
 		wrap = ndisks - groupstart;
 
@@ -421,11 +416,11 @@ vdev_draid_map_alloc(zio_t *zio)
 
 		/* increment the offset if we wrap to the next row */
 		if (c == wrap)
-			o += DRAID_SLICESIZE;
+			physical_offset += DRAID_SLICESIZE;
 
 		rm->rm_col[c].rc_devidx =
 		    vdev_draid_permute_id(vdc, base, iter, i);
-		rm->rm_col[c].rc_offset = o;
+		rm->rm_col[c].rc_offset = physical_offset;
 		rm->rm_col[c].rc_abd = NULL;
 		rm->rm_col[c].rc_gdata = NULL;
 		rm->rm_col[c].rc_error = 0;
@@ -533,11 +528,10 @@ uint64_t
 vdev_draid_get_astart(const vdev_t *vd, const uint64_t start)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t align = (vdc->vdc_data + vd->vdev_nparity) << vd->vdev_ashift;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	return (roundup(start, align));
+	return (roundup(start, (vdc->vdc_groupwidth) << vd->vdev_ashift));
 }
 
 /*
@@ -696,16 +690,14 @@ boolean_t
 vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
     uint64_t size)
 {
-	uint64_t *base, iter;
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
 	uint64_t group = vdev_draid_offset_to_group(vd, offset);
-	ASSERT3U(group, ==,
-	    vdev_draid_offset_to_group(vd, offset + size - 1));
-
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t perm = group / vdc->vdc_groups;
+
+	uint64_t *base, iter;
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
 
 	/*
@@ -713,14 +705,16 @@ vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
 	 * find the disk offset for the permutation slice in order to
 	 * determine the mapping of distributed spare drives.
 	 */
-	uint64_t coff = perm * vdc->vdc_groupsz;
+	uint64_t physical_offset = perm * (vdc->vdc_slicesz / vdc->vdc_ndisks);
+
 	for (int c = 0; c < vdc->vdc_children; c++) {
 		uint64_t cid = vdev_draid_permute_id(vdc, base, iter, c);
 		vdev_t *cvd = vd->vdev_child[cid];
 
-		if (vdev_draid_vd_degraded(cvd, fault_vdev, coff))
+		if (vdev_draid_vd_degraded(cvd, fault_vdev, physical_offset))
 			return (B_TRUE);
 	}
+
 	return (B_FALSE);
 }
 
@@ -759,25 +753,43 @@ vdev_draid_config_create(vdev_t *vd)
 	}
 
 	vdev_draid_config_t *vdc = kmem_alloc(sizeof (*vdc), KM_SLEEP);
-	vdc->vdc_children = fnvlist_lookup_uint64(nvl,
-	    ZPOOL_CONFIG_DRAIDCFG_CHILDREN);
-	vdc->vdc_groups = fnvlist_lookup_uint64(nvl,
-	    ZPOOL_CONFIG_DRAIDCFG_GROUPS);
+
+	/*
+	 * Values read from the ZPOOL_CONFIG_DRAIDCFG.
+	 */
+	vdc->vdc_guid = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_GUID);
+	vdc->vdc_seed = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_SEED);
 	vdc->vdc_data = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_DATA);
 	vdc->vdc_parity = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_PARITY);
 	vdc->vdc_spares = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_SPARES);
-	vdc->vdc_groupsz =
-	    (vdc->vdc_data + vdc->vdc_parity) << DRAID_SLICESHIFT;
-
-	vdc->vdc_bases = fnvlist_lookup_uint64(nvl, ZPOOL_CONFIG_DRAIDCFG_BASE);
-
+	vdc->vdc_children = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_CHILDREN);
+	vdc->vdc_groups = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_GROUPS);
+	vdc->vdc_bases = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_BASE);
 	VERIFY0(nvlist_lookup_uint8_array(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_PERM, &perms, &c));
-
 	vdc->vdc_base_perms = vdev_draid_create_base_permutations(perms, vdc);
+
+	/*
+	 * Derived constants.
+	 */
+	vdc->vdc_groupwidth = vdc->vdc_data + vdc->vdc_parity;
+	vdc->vdc_ndisks = vdc->vdc_children - vdc->vdc_spares;
+	vdc->vdc_groupsz = vdc->vdc_groupwidth * DRAID_SLICESIZE;
+	vdc->vdc_slicesz = vdc->vdc_groupsz * vdc->vdc_groups;
+
+	ASSERT3U(vdc->vdc_groupwidth, >=, 2);
+	ASSERT3U(vdc->vdc_ndisks, >=, 3);
+	ASSERT3U(vdc->vdc_groupsz, >=, 2 * DRAID_SLICESIZE);
+	ASSERT3U(vdc->vdc_slicesz, >=, 2 * DRAID_SLICESIZE);
+	ASSERT3U(vdc->vdc_slicesz % vdc->vdc_ndisks, ==, 0);
 
 	return (vdc);
 }
@@ -936,17 +948,14 @@ vdev_draid_psize_to_asize(const vdev_t *vd, uint64_t offset, uint64_t psize)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t nparity = vd->vdev_nparity;
 	uint64_t asize = ((psize - 1) >> ashift) + 1;
-	uint64_t ndata = vdc->vdc_data;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
-	ASSERT3U(ndata, !=, 0);
 
-	asize = roundup(asize, ndata);
-	asize += nparity * (asize / ndata);
+	asize = roundup(asize, vdc->vdc_data);
+	asize += vdc->vdc_parity * (asize / vdc->vdc_data);
 
-	ASSERT0(asize % (nparity + ndata));
+	ASSERT0(asize % (vdc->vdc_groupwidth));
 	ASSERT(asize != 0);
 
 	return (asize << ashift);
@@ -966,9 +975,8 @@ uint64_t
 vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
-	uint64_t dataplusparity = vdc->vdc_data + vd->vdev_nparity;
 
-	return ((asize / dataplusparity) * vdc->vdc_data);
+	return ((asize / vdc->vdc_groupwidth) * vdc->vdc_data);
 }
 
 /*
@@ -979,7 +987,6 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t ndata = vdc->vdc_data;
 
 	/*
 	 * When the maxpsize >> ashift does not divide evenly by the number
@@ -988,8 +995,8 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t offset, uint64_t maxpsize)
 	 * than the maximum allowed block size.
 	 */
 	maxpsize >>= ashift;
-	maxpsize /= ndata;
-	maxpsize *= ndata;
+	maxpsize /= vdc->vdc_data;
+	maxpsize *= vdc->vdc_data;
 	maxpsize <<= ashift;
 
 	return (vdev_draid_psize_to_asize(vd, offset, maxpsize));
@@ -1201,7 +1208,7 @@ vdev_draid_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 	ASSERT(raidvd->vdev_ops == &vdev_draid_ops);
 
 	vdev_draid_config_t *vdc = raidvd->vdev_tsd;
-	uint64_t ashift __maybe_unused = raidvd->vdev_top->vdev_ashift;
+	uint64_t ashift = raidvd->vdev_top->vdev_ashift;
 
 	/* Make sure the offsets are block-aligned */
 	ASSERT0(in->rs_start % (1 << ashift));
@@ -1336,18 +1343,18 @@ vdev_draid_spare_is_active(vdev_t *vd)
 /*
  * Given a dRAID distribute spare vdev, returns the physical child vdev
  * on which the provided offset resides.  This may involve recursing through
- * multiple layers of distributed spares.
- * Note that offset is relative to this vdev.
+ * multiple layers of distributed spares.  Note that offset is relative to
+ * this vdev.
  */
 static vdev_t *
-vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
+vdev_draid_spare_get_child(vdev_t *vd, uint64_t physical_offset)
 {
 	vdev_draid_spare_t *vds = vd->vdev_tsd;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_spare_ops);
 
 	/* The vdev is closed or an invalid offset was provided. */
-	if (vds == NULL || offset >= vd->vdev_psize -
+	if (vds == NULL || physical_offset >= vd->vdev_psize -
 	    (VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE)) {
 		return (NULL);
 	}
@@ -1358,10 +1365,9 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 	ASSERT3P(tvd->vdev_ops, ==, &vdev_draid_ops);
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_spares);
 
-	uint64_t group = vdev_draid_offset_to_group(tvd, offset);
-	uint64_t perm = group / vdc->vdc_groups;
-
 	uint64_t *base, iter;
+	uint64_t perm = physical_offset / (vdc->vdc_slicesz / vdc->vdc_ndisks);
+
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
 
 	uint64_t cid = vdev_draid_permute_id(vdc, base, iter,
@@ -1369,7 +1375,7 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset)
 	vdev_t *cvd = tvd->vdev_child[cid];
 
 	if (cvd->vdev_ops == &vdev_draid_spare_ops)
-		return (vdev_draid_spare_get_child(cvd, offset));
+		return (vdev_draid_spare_get_child(cvd, physical_offset));
 
 	return (cvd);
 }
