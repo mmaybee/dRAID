@@ -67,16 +67,6 @@ vdev_draid_config_validate(nvlist_t *config,
 	if (required_parity != 0 && p != required_parity)
 		return (DRAIDCFG_ERR_PARITY_MISMATCH);
 
-	/* Validate configuration spares exists and are within range. */
-	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_SPARES, &s))
-		return (DRAIDCFG_ERR_SPARES_MISSING);
-
-	if (s == 0 || s > VDEV_DRAID_MAX_SPARES || s > (n - (d + p)))
-		return (DRAIDCFG_ERR_SPARES_INVALID);
-
-	if (required_spares != 0 && s != required_spares)
-		return (DRAIDCFG_ERR_SPARES_MISMATCH);
-
 	/* Validate configuration children exists and are within range. */
 	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_CHILDREN, &n))
 		return (DRAIDCFG_ERR_CHILDREN_MISSING);
@@ -86,6 +76,16 @@ vdev_draid_config_validate(nvlist_t *config,
 
 	if (required_children != 0 && n != required_children)
 		return (DRAIDCFG_ERR_CHILDREN_MISMATCH);
+
+	/* Validate configuration spares exists and are within range. */
+	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_SPARES, &s))
+		return (DRAIDCFG_ERR_SPARES_MISSING);
+
+	if (s == 0 || s > VDEV_DRAID_MAX_SPARES || s > (n - (d + p)))
+		return (DRAIDCFG_ERR_SPARES_INVALID);
+
+	if (required_spares != 0 && s != required_spares)
+		return (DRAIDCFG_ERR_SPARES_MISMATCH);
 
 	/* Validate configuration groups exists and are within range. */
 	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_GROUPS, &g))
