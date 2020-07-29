@@ -70,7 +70,6 @@ typedef struct dsl_scan_phys {
 } dsl_scan_phys_t;
 
 #define	SCAN_PHYS_NUMINTS (sizeof (dsl_scan_phys_t) / sizeof (uint64_t))
-CTASSERT_GLOBAL(sizeof (dsl_scan_phys_t) == 24 * sizeof (uint64_t));
 
 typedef enum dsl_scan_flags {
 	DSF_VISIT_DS_AGAIN = 1<<0,

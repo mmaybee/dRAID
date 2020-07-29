@@ -2926,6 +2926,8 @@ metaslab_set_fragmentation(metaslab_t *msp, boolean_t nodirty)
  *
  * This function returns adjusted size to calculate metaslab weight, and
  * should not be used for other purposes.
+ *
+ * XXX - Revist the need for this with the alternate dRAID layout.
  */
 static uint64_t
 metaslab_weight_size(metaslab_t *msp)

@@ -657,8 +657,8 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	spa_config_enter(spa, SCL_STATE_ALL, vd, RW_READER);
 	mutex_enter(&vd->vdev_rebuild_lock);
 
+	/* This is the first I/O for this txg. */
 	if (vr->vr_scan_offset[txg & TXG_MASK] == 0) {
-		/* This is the first I/O for this txg. */
 		vr->vr_scan_offset[txg & TXG_MASK] = start;
 		dsl_sync_task_nowait(spa_get_dsl(spa),
 		    vdev_rebuild_update_sync,

@@ -433,6 +433,8 @@ ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_vdev_aux_add_remove, 1, &ztest_opts.zo_vdevtime),
 	ZTI_INIT(ztest_device_removal, 1, &zopt_sometimes),
 	ZTI_INIT(ztest_spa_checkpoint_create_discard, 1, &zopt_rarely),
+	ZTI_INIT(ztest_initialize, 1, &zopt_sometimes),
+	ZTI_INIT(ztest_trim, 1, &zopt_sometimes),
 	ZTI_INIT(ztest_fletcher, 1, &zopt_rarely),
 	ZTI_INIT(ztest_fletcher_incr, 1, &zopt_rarely),
 	ZTI_INIT(ztest_verify_dnode_bt, 1, &zopt_sometimes),
@@ -1065,14 +1067,6 @@ ztest_get_ashift(void)
 	return (ztest_opts.zo_ashift);
 }
 
-static int
-ztest_check_path(char *path)
-{
-	struct stat s;
-	/* return true on success */
-	return (!stat(path, &s));
-}
-
 static nvlist_t *
 make_vdev_file(char *path, char *aux, char *pool, size_t size, uint64_t ashift)
 {
@@ -1138,13 +1132,13 @@ make_vdev_raid(char *path, char *aux, char *pool, size_t size,
 	for (c = 0; c < r; c++)
 		child[c] = make_vdev_file(path, aux, pool, size, ashift);
 
-	VERIFY(nvlist_alloc(&raid, NV_UNIQUE_NAME, 0) == 0);
-	VERIFY(nvlist_add_string(raid, ZPOOL_CONFIG_TYPE,
-	    ztest_opts.zo_raid_type) == 0);
-	VERIFY(nvlist_add_uint64(raid, ZPOOL_CONFIG_NPARITY,
-	    ztest_opts.zo_raid_parity) == 0);
-	VERIFY(nvlist_add_nvlist_array(raid, ZPOOL_CONFIG_CHILDREN,
-	    child, r) == 0);
+	VERIFY0(nvlist_alloc(&raid, NV_UNIQUE_NAME, 0));
+	VERIFY0(nvlist_add_string(raid, ZPOOL_CONFIG_TYPE,
+	    ztest_opts.zo_raid_type));
+	VERIFY0(nvlist_add_uint64(raid, ZPOOL_CONFIG_NPARITY,
+	    ztest_opts.zo_raid_parity));
+	VERIFY0(nvlist_add_nvlist_array(raid, ZPOOL_CONFIG_CHILDREN,
+	    child, r));
 
 	if (strcmp(ztest_opts.zo_raid_type, VDEV_TYPE_DRAID) == 0) {
 		nvlist_t *draidcfg;
@@ -1154,8 +1148,8 @@ make_vdev_raid(char *path, char *aux, char *pool, size_t size,
 		    DRAIDCFG_DEFAULT_PASSES, DRAIDCFG_DEFAULT_EVAL,
 		    DRAIDCFG_DEFAULT_FAULTS, &draidcfg), ==, DRAIDCFG_OK);
 		VERIFY3P(draidcfg, !=, NULL);
-		VERIFY(nvlist_add_nvlist(raid, ZPOOL_CONFIG_DRAIDCFG,
-		    draidcfg) == 0);
+		VERIFY0(nvlist_add_nvlist(raid, ZPOOL_CONFIG_DRAIDCFG,
+		    draidcfg));
 		vdev_draid_config_free(draidcfg);
 	}
 
@@ -2902,10 +2896,9 @@ ztest_spa_upgrade(ztest_ds_t *zd, uint64_t id)
 	if (ztest_opts.zo_mmp_test)
 		return;
 
-	/* skip upgrade testing for dRAID */
+	/* dRAID added after feature flags, skip upgrade test. */
 	if (strcmp(ztest_opts.zo_raid_type, VDEV_TYPE_DRAID) == 0)
 		return;
-
 
 	mutex_enter(&ztest_vdev_lock);
 	name = kmem_asprintf("%s_upgrade", ztest_opts.zo_pool);
@@ -4031,7 +4024,6 @@ ztest_dataset_create(char *dsname)
 	 * wrapping key.
 	 */
 	rand = ztest_random(2);
-
 	if (rand != 0) {
 		nvlist_t *crypto_args = fnvlist_alloc();
 		nvlist_t *props = fnvlist_alloc();
@@ -5004,13 +4996,13 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 			void *packcheck = umem_alloc(packsize, UMEM_NOFAIL);
 			void *bigcheck = umem_alloc(bigsize, UMEM_NOFAIL);
 
-			VERIFY3U(0, ==, dmu_read(os, packobj, packoff,
+			VERIFY0(dmu_read(os, packobj, packoff,
 			    packsize, packcheck, DMU_READ_PREFETCH));
-			VERIFY3U(0, ==, dmu_read(os, bigobj, bigoff,
+			VERIFY0(dmu_read(os, bigobj, bigoff,
 			    bigsize, bigcheck, DMU_READ_PREFETCH));
 
-			ASSERT3U(bcmp(packbuf, packcheck, packsize), ==, 0);
-			ASSERT3U(bcmp(bigbuf, bigcheck, bigsize), ==, 0);
+			ASSERT0(bcmp(packbuf, packcheck, packsize));
+			ASSERT0(bcmp(bigbuf, bigcheck, bigsize));
 
 			umem_free(packcheck, packsize);
 			umem_free(bigcheck, bigsize);
@@ -6362,6 +6354,14 @@ ztest_fletcher_incr(ztest_ds_t *zd, uint64_t id)
 
 		umem_free(buf, size);
 	}
+}
+
+static int
+ztest_check_path(char *path)
+{
+	struct stat s;
+	/* return true on success */
+	return (!stat(path, &s));
 }
 
 static void
