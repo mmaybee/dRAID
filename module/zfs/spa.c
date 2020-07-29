@@ -3686,7 +3686,14 @@ spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
 	/*
 	 * Build a new vdev tree from the trusted config
 	 */
-	VERIFY(spa_config_parse(spa, &mrvd, nv, NULL, 0, VDEV_ALLOC_LOAD) == 0);
+	error = spa_config_parse(spa, &mrvd, nv, NULL, 0, VDEV_ALLOC_LOAD);
+	if (error != 0) {
+		nvlist_free(mos_config);
+		spa_config_exit(spa, SCL_ALL, FTAG);
+		spa_load_failed(spa, "spa_config_parse failed [error=%d]",
+		    error);
+		return (spa_vdev_err(rvd, VDEV_AUX_CORRUPT_DATA, error));
+	}
 
 	/*
 	 * Vdev paths in the MOS may be obsolete. If the untrusted config was
