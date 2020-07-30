@@ -408,31 +408,31 @@ vdev_draid_map_alloc(zio_t *zio)
 
 	uint64_t *base, iter, asize = 0;
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
-	for (uint64_t c = 0; c < groupwidth; c++) {
-		uint64_t i = (groupstart + c) % ndisks;
+	for (uint64_t i = 0; i < groupwidth; i++) {
+		uint64_t c = (groupstart + i) % ndisks;
 
 		/* increment the offset if we wrap to the next row */
-		if (c == wrap)
+		if (i == wrap)
 			physical_offset += DRAID_ROWSIZE;
 
-		rm->rm_col[c].rc_devidx =
-		    vdev_draid_permute_id(vdc, base, iter, i);
-		rm->rm_col[c].rc_offset = physical_offset;
-		rm->rm_col[c].rc_abd = NULL;
-		rm->rm_col[c].rc_gdata = NULL;
-		rm->rm_col[c].rc_error = 0;
-		rm->rm_col[c].rc_tried = 0;
-		rm->rm_col[c].rc_skipped = 0;
-		rm->rm_col[c].rc_repair = 0;
+		rm->rm_col[i].rc_devidx =
+		    vdev_draid_permute_id(vdc, base, iter, c);
+		rm->rm_col[i].rc_offset = physical_offset;
+		rm->rm_col[i].rc_abd = NULL;
+		rm->rm_col[i].rc_gdata = NULL;
+		rm->rm_col[i].rc_error = 0;
+		rm->rm_col[i].rc_tried = 0;
+		rm->rm_col[i].rc_skipped = 0;
+		rm->rm_col[i].rc_repair = 0;
 
-		if (c >= rm->rm_cols)
-			rm->rm_col[c].rc_size = 0;
-		else if (c < bc)
-			rm->rm_col[c].rc_size = (q + 1) << ashift;
+		if (i >= rm->rm_cols)
+			rm->rm_col[i].rc_size = 0;
+		else if (i < bc)
+			rm->rm_col[i].rc_size = (q + 1) << ashift;
 		else
-			rm->rm_col[c].rc_size = q << ashift;
+			rm->rm_col[i].rc_size = q << ashift;
 
-		asize += rm->rm_col[c].rc_size;
+		asize += rm->rm_col[i].rc_size;
 	}
 
 	ASSERT3U(asize, ==, tot << ashift);
@@ -615,13 +615,14 @@ vdev_draid_check_block(vdev_t *vd, uint64_t start, uint64_t *asizep)
  * on.
  */
 boolean_t
-vdev_draid_missing(vdev_t *vd, uint64_t offset, uint64_t txg, uint64_t size)
+vdev_draid_missing(vdev_t *vd, uint64_t physical_offset, uint64_t txg,
+    uint64_t size)
 {
 	if (vdev_dtl_contains(vd, DTL_MISSING, txg, size))
 		return (B_TRUE);
 
 	if (vd->vdev_ops == &vdev_draid_spare_ops) {
-		vd = vdev_draid_spare_get_child(vd, offset);
+		vd = vdev_draid_spare_get_child(vd, physical_offset);
 		if (vd == NULL)
 			return (B_TRUE);
 	}
@@ -638,7 +639,7 @@ vdev_draid_missing(vdev_t *vd, uint64_t offset, uint64_t txg, uint64_t size)
 		if (!vdev_readable(cvd))
 			continue;
 
-		if (!vdev_draid_missing(cvd, offset, txg, size))
+		if (!vdev_draid_missing(cvd, physical_offset, txg, size))
 			return (B_FALSE);
 	}
 
@@ -649,10 +650,10 @@ vdev_draid_missing(vdev_t *vd, uint64_t offset, uint64_t txg, uint64_t size)
  * Determine if the vdev is readable at the given offset.
  */
 boolean_t
-vdev_draid_readable(vdev_t *vd, uint64_t offset)
+vdev_draid_readable(vdev_t *vd, uint64_t physical_offset)
 {
 	if (vd->vdev_ops == &vdev_draid_spare_ops) {
-		vd = vdev_draid_spare_get_child(vd, offset);
+		vd = vdev_draid_spare_get_child(vd, physical_offset);
 		if (vd == NULL)
 			return (B_FALSE);
 	}
@@ -684,12 +685,18 @@ vdev_draid_find_spare(vdev_t *vd)
  * replacing or sparing vdev tree.
  */
 static boolean_t
-vdev_draid_faulted(vdev_t *vd, uint64_t offset)
+vdev_draid_faulted(vdev_t *vd, uint64_t physical_offset)
 {
 	if (vd->vdev_ops == &vdev_draid_spare_ops) {
-		vd = vdev_draid_spare_get_child(vd, offset);
+		vd = vdev_draid_spare_get_child(vd, physical_offset);
 		if (vd == NULL)
 			return (B_FALSE);
+
+		/*
+		 * After resolving the distributed spare to a leaf vdev
+		 * check the parent to determine if it's "faulted".
+		 */
+		vd = vd->vdev_parent;
 	}
 
 	return (vd->vdev_ops == &vdev_replacing_ops ||
@@ -697,9 +704,10 @@ vdev_draid_faulted(vdev_t *vd, uint64_t offset)
 }
 
 static boolean_t
-vdev_draid_vd_degraded(vdev_t *vd, uint64_t offset, uint64_t phys_birth)
+vdev_draid_vd_degraded(vdev_t *vd, uint64_t physical_offset,
+    uint64_t phys_birth)
 {
-	if (!vdev_draid_faulted(vd, offset))
+	if (!vdev_draid_faulted(vd, physical_offset))
 		return (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1));
 
 	return (B_TRUE);
@@ -709,7 +717,7 @@ vdev_draid_vd_degraded(vdev_t *vd, uint64_t offset, uint64_t phys_birth)
  * Determine if the dRAID block at the logical offset is degraded.
  */
 boolean_t
-vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size,
+vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t psize,
     uint64_t phys_birth)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
@@ -723,8 +731,8 @@ vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size,
 	uint64_t *base, iter;
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
 
-	for (int i = groupstart; i < vdc->vdc_groupwidth; i++) {
-		int c = i % vdc->vdc_children;
+	for (uint64_t i = 0; i < vdc->vdc_groupwidth; i++) {
+		uint64_t c = (groupstart + i) % vdc->vdc_ndisks;
 		uint64_t cid = vdev_draid_permute_id(vdc, base, iter, c);
 		vdev_t *cvd = vd->vdev_child[cid];
 
