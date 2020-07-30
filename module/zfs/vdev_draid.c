@@ -661,28 +661,6 @@ vdev_draid_readable(vdev_t *vd, uint64_t offset)
 }
 
 /*
- * Returns B_TRUE if the guid exists in the vdev tree rooted at 'vd'.
- */
-static boolean_t
-vdev_draid_guid_exists(vdev_t *vd, uint64_t guid, uint64_t offset)
-{
-	if (vd->vdev_ops == &vdev_draid_spare_ops) {
-		vd = vdev_draid_spare_get_child(vd, offset);
-		if (vd == NULL)
-			return (B_FALSE);
-	}
-
-	if (vd->vdev_ops->vdev_op_leaf)
-		return (vd->vdev_guid == guid);
-
-	for (int c = 0; c < vd->vdev_children; c++)
-		if (vdev_draid_guid_exists(vd->vdev_child[c], guid, offset))
-			return (B_TRUE);
-
-	return (B_FALSE);
-}
-
-/*
  * Returns the first distributed spare found under the provided vdev tree.
  */
 static vdev_t *
@@ -700,18 +678,30 @@ vdev_draid_find_spare(vdev_t *vd)
 	return (NULL);
 }
 
+/*
+ * Returns B_TRUE if the passed in vdev is currently "faulted".
+ * Faulted, in this context, means that the vdev represents a
+ * replacing or sparing vdev tree.
+ */
 static boolean_t
-vdev_draid_vd_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset)
+vdev_draid_faulted(vdev_t *vd, uint64_t offset)
 {
-	/* Resilver */
-	if (fault_vdev == NULL)
+	if (vd->vdev_ops == &vdev_draid_spare_ops) {
+		vd = vdev_draid_spare_get_child(vd, offset);
+		if (vd == NULL)
+			return (B_FALSE);
+	}
+
+	return (vd->vdev_ops == &vdev_replacing_ops ||
+	    vd->vdev_ops == &vdev_spare_ops);
+}
+
+static boolean_t
+vdev_draid_vd_degraded(vdev_t *vd, uint64_t offset)
+{
+	if (!vdev_draid_faulted(vd, offset))
 		return (!vdev_dtl_empty(vd, DTL_PARTIAL));
-
-	/* Rebuild */
-	ASSERT(fault_vdev->vdev_ops->vdev_op_leaf);
-	ASSERT(fault_vdev->vdev_ops != &vdev_draid_spare_ops);
-
-	return (vdev_draid_guid_exists(vd, fault_vdev->vdev_guid, offset));
+	return (B_TRUE);
 }
 
 /*
@@ -719,31 +709,25 @@ vdev_draid_vd_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset)
  * degraded if the fault_vdev was unavailable.
  */
 boolean_t
-vdev_draid_group_degraded(vdev_t *vd, vdev_t *fault_vdev, uint64_t offset,
-    uint64_t size)
+vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 
-	uint64_t group = vdev_draid_offset_to_group(vd, offset);
-	uint64_t perm = group / vdc->vdc_ngroups;
+	uint64_t groupstart, perm;
+	uint64_t physical_offset = vdev_draid_logical_to_physical(vd,
+	    offset, &perm, &groupstart);
 
 	uint64_t *base, iter;
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
 
-	/*
-	 * For the purposes of vdev_draid_vd_degraded(), we need to
-	 * find the disk offset for the permutation slice in order to
-	 * determine the mapping of distributed spare drives.
-	 */
-	uint64_t physical_offset = perm * (vdc->vdc_slicesz / vdc->vdc_ndisks);
-
-	for (int c = 0; c < vdc->vdc_children; c++) {
+	for (int i = groupstart; i < vdc->vdc_groupwidth; i++) {
+		int c = i % vdc->vdc_children;
 		uint64_t cid = vdev_draid_permute_id(vdc, base, iter, c);
 		vdev_t *cvd = vd->vdev_child[cid];
 
-		if (vdev_draid_vd_degraded(cvd, fault_vdev, physical_offset))
+		if (vdev_draid_vd_degraded(cvd, physical_offset))
 			return (B_TRUE);
 	}
 
@@ -815,13 +799,14 @@ vdev_draid_config_create(vdev_t *vd)
 	vdc->vdc_groupwidth = vdc->vdc_ndata + vdc->vdc_nparity;
 	vdc->vdc_ndisks = vdc->vdc_children - vdc->vdc_nspares;
 	vdc->vdc_groupsz = vdc->vdc_groupwidth * DRAID_ROWSIZE;
-	vdc->vdc_slicesz = vdc->vdc_groupsz * vdc->vdc_ngroups;
+	vdc->vdc_devslicesz = (vdc->vdc_groupsz * vdc->vdc_ngroups) /
+	    vdc->vdc_ndisks;
 
 	ASSERT3U(vdc->vdc_groupwidth, >=, 2);
-	ASSERT3U(vdc->vdc_ndisks, >=, 2);
+	ASSERT3U(vdc->vdc_groupwidth, <=, vdc->vdc_ndisks);
 	ASSERT3U(vdc->vdc_groupsz, >=, 2 * DRAID_ROWSIZE);
-	ASSERT3U(vdc->vdc_slicesz, >=, 2 * DRAID_ROWSIZE);
-	ASSERT3U(vdc->vdc_slicesz % vdc->vdc_ndisks, ==, 0);
+	ASSERT3U(vdc->vdc_devslicesz, >=, DRAID_ROWSIZE);
+	ASSERT3U(vdc->vdc_devslicesz % DRAID_ROWSIZE, ==, 0);
 	ASSERT3U((vdc->vdc_groupwidth * vdc->vdc_ngroups) %
 	    vdc->vdc_ndisks, ==, 0);
 
@@ -996,23 +981,6 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t maxpsize)
 }
 
 /*
- * Returns the number of active distributed spares in the dRAID vdev tree.
- */
-static int
-vdev_draid_active_spares(vdev_t *vd)
-{
-	int nspares = 0;
-
-	if (vd->vdev_ops == &vdev_draid_spare_ops)
-		return (1);
-
-	for (int c = 0; c < vd->vdev_children; c++)
-		nspares += vdev_draid_active_spares(vd->vdev_child[c]);
-
-	return (nspares);
-}
-
-/*
  * The DVA needs to be resilvered when:
  *   1. There are multiple active distributed spares.
  *      See the comment in vdev_draid_io_start(); or
@@ -1023,16 +991,13 @@ static boolean_t
 vdev_draid_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
     uint64_t phys_birth)
 {
-	vdev_draid_config_t *vdc = vd->vdev_tsd;
+	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 	uint64_t offset = DVA_GET_OFFSET(dva);
 
-	if (vdc->vdc_nspares > 1 && vdev_draid_active_spares(vd) > 1)
-		return (B_TRUE);
+	if (!vdev_draid_group_degraded(vd, offset, psize))
+		return (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1));
 
-	if (!vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
-		return (B_FALSE);
-
-	return (vdev_draid_group_degraded(vd, NULL, offset, psize));
+	return (B_TRUE);
 }
 
 static void
@@ -1358,7 +1323,7 @@ vdev_draid_spare_get_child(vdev_t *vd, uint64_t physical_offset)
 	ASSERT3U(vds->vds_spare_id, <, vdc->vdc_nspares);
 
 	uint64_t *base, iter;
-	uint64_t perm = physical_offset / (vdc->vdc_slicesz / vdc->vdc_ndisks);
+	uint64_t perm = physical_offset / vdc->vdc_devslicesz;
 
 	vdev_draid_get_perm(vdc, perm, &base, &iter);
 

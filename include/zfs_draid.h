@@ -121,10 +121,10 @@ typedef struct vdev_draid_config {
 	/*
 	 * Immutable derived constants.
 	 */
-	uint64_t vdc_groupwidth;	/* = vdc_data + vdc_parity */
-	uint64_t vdc_ndisks;		/* = vdc_children - vdc_spares */
-	uint64_t vdc_groupsz;		/* = vdc_groupwidth * DRAID_SLICESIZE */
-	uint64_t vdc_slicesz;		/* = vdc_groupsz * vdc_groups */
+	uint64_t vdc_groupwidth;	/* = data + parity */
+	uint64_t vdc_ndisks;		/* = children - spares */
+	uint64_t vdc_groupsz;		/* = groupwidth * DRAID_ROWSIZE */
+	uint64_t vdc_devslicesz;	/* = (groupsz * groups) / ndisks */
 } vdev_draid_config_t;
 
 

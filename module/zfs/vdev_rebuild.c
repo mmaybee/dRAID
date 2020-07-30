@@ -125,89 +125,12 @@ static void vdev_rebuild_thread(void *arg);
 static boolean_t
 draid_group_degraded(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 {
-	uint64_t faults = vr->vr_faults;
-
 	ASSERT(vr->vr_top_vdev->vdev_ops == &vdev_draid_ops);
-	ASSERT3U(faults, <=, REBUILD_FAULTS_MAX);
 
 	if (vr->vr_rebuild_all == B_TRUE)
 		return (B_TRUE);
 
-	for (int i = 0; i < faults; i++) {
-		if (vdev_draid_group_degraded(vr->vr_top_vdev,
-		    vr->vr_fault_vdevs[i], start, size)) {
-			return (B_TRUE);
-		}
-	}
-
-	return (B_FALSE);
-}
-
-/*
- * For dRAID add up to REBUILD_FAULTS_MAX (3) vdev's to the faulted list.
- * If we encounter more faulted devices than this it means the replacing /
- * sparing vdevs likely have more than two children.  In this uncommon
- * case disable this dRAID optimization and rebuild the entire space map.
- */
-static int
-add_faulted_guids(vdev_rebuild_t *vr, vdev_t *vd)
-{
-	int error = 0;
-
-	for (uint64_t i = 0; i < vd->vdev_children; i++) {
-		error = add_faulted_guids(vr, vd->vdev_child[i]);
-		if (error)
-			return (error);
-	}
-
-	/* dRAID spares are excluded from the faulted list */
-	if ((vd->vdev_parent->vdev_ops == &vdev_replacing_ops ||
-	    vd->vdev_parent->vdev_ops == &vdev_spare_ops) &&
-	    (vd->vdev_ops != &vdev_draid_spare_ops)) {
-
-		if (vr->vr_faults >= REBUILD_FAULTS_MAX)
-			return (SET_ERROR(EOVERFLOW));
-
-		vr->vr_fault_vdevs[vr->vr_faults] = vd;
-		vr->vr_faults++;
-	}
-
-	return (0);
-}
-
-/*
- * For a dRAID rebuild determine the guids of any faulted vdevs.  For
- * a mirror this is not needed and vr_rebuild_all can be set to B_TRUE.
- */
-static void
-setup_faulted_guids(vdev_rebuild_t *vr)
-{
-	vdev_t *tvd = vr->vr_top_vdev;
-
-	ASSERT(MUTEX_HELD(&tvd->vdev_rebuild_lock));
-
-	vr->vr_faults = 0;
-	bzero(vr->vr_fault_vdevs, sizeof (vdev_t *) * REBUILD_FAULTS_MAX);
-
-	if (tvd->vdev_ops == &vdev_draid_ops) {
-		/*
-		 * Determine the faulted vdevs based on the pool configuration.
-		 * For the purposes of the dRAID rebuild a vdev is considered
-		 * to be faulted if it is a child of either a replacing or
-		 * sparing vdev type.  Tracking these vdevs allows the dRAID
-		 * rebuild to skip regions of the space map which are not
-		 * degraded due to the fault and so do not need to be rebuilt.
-		 */
-		if (add_faulted_guids(vr, tvd) != 0)
-			vr->vr_rebuild_all = B_TRUE;
-
-	} else {
-		/*
-		 * For mirrors the entire space map must also always be
-		 * rebuilt.  Indicate this by setting vr->vr_rebuild_all.
-		 */
-		vr->vr_rebuild_all = B_TRUE;
-	}
+	return (vdev_draid_group_degraded(vr->vr_top_vdev, start, size));
 }
 
 /*
@@ -883,7 +806,6 @@ vdev_rebuild_thread(void *arg)
 	uint64_t update_est_time = gethrtime();
 	vdev_rebuild_update_bytes_est(vd, 0);
 
-	setup_faulted_guids(vr);
 	clear_rebuild_bytes(vr->vr_top_vdev);
 
 	mutex_exit(&vd->vdev_rebuild_lock);
