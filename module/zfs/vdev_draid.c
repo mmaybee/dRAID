@@ -705,8 +705,7 @@ vdev_draid_vd_degraded(vdev_t *vd, uint64_t offset)
 }
 
 /*
- * Determine if the dRAID block at the logical offset and size would be
- * degraded if the fault_vdev was unavailable.
+ * Determine if the dRAID block at the logical offset is degraded.
  */
 boolean_t
 vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size)
@@ -964,9 +963,12 @@ vdev_draid_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
  * Return the asize of the largest block which can be reconstructed.
  */
 uint64_t
-vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t maxpsize)
+vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t max_segment)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
+
+	uint64_t psize = MIN(P2ROUNDUP(max_segment * vdc->vdc_ndata,
+	    1 << vd->vdev_ashift), SPA_MAXBLOCKSIZE);
 
 	/*
 	 * When the maxpsize >> ashift does not divide evenly by the number
@@ -974,12 +976,12 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t maxpsize)
 	 * sectors will cause vdev_draid_asize_to_psize() to get a psize larger
 	 * than the maximum allowed block size.
 	 */
-	maxpsize >>= vd->vdev_ashift;
-	maxpsize /= vdc->vdc_ndata;
-	maxpsize *= vdc->vdc_ndata;
-	maxpsize <<= vd->vdev_ashift;
+	psize >>= vd->vdev_ashift;
+	psize /= vdc->vdc_ndata;
+	psize *= vdc->vdc_ndata;
+	psize <<= vd->vdev_ashift;
 
-	return (vdev_draid_asize(vd, maxpsize));
+	return (vdev_draid_asize(vd, psize));
 }
 
 /*

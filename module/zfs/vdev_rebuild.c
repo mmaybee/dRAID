@@ -105,10 +105,11 @@
  * zfs_vdev_rebuild_min_active and zfs_vdev_rebuild_max_active module
  * options.
  */
-unsigned int zfs_rebuild_queue_limit = 20;
+unsigned int zfs_rebuild_queue_limit = 32;
 
 /*
- * Size of rebuild reads; defaults to 1MiB and is capped at SPA_MAXBLOCKSIZE.
+ * Size of rebuild reads; defaults to 1MiB per data disk and is capped at
+ * SPA_MAXBLOCKSIZE.
  */
 unsigned long zfs_rebuild_max_segment = 1024 * 1024;
 
@@ -620,15 +621,13 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 static uint64_t
 vdev_rebuild_chunk_size(vdev_t *vd, uint64_t start, uint64_t size)
 {
-	uint64_t chunk_size, max_asize, max_segment;
-
-	max_segment = MIN(P2ROUNDUP(zfs_rebuild_max_segment,
-	    1 << vd->vdev_ashift), SPA_MAXBLOCKSIZE);
+	uint64_t chunk_size, max_asize;
 
 	if (vd->vdev_ops == &vdev_draid_ops) {
 		uint64_t group, left;
 
-		max_asize = vdev_draid_max_rebuildable_asize(vd, max_segment);
+		max_asize = vdev_draid_max_rebuildable_asize(vd,
+		    zfs_rebuild_max_segment);
 		chunk_size = MIN(size, max_asize);
 
 		group = vdev_draid_offset_to_group(vd, start);
@@ -641,6 +640,9 @@ vdev_rebuild_chunk_size(vdev_t *vd, uint64_t start, uint64_t size)
 		ASSERT(vd->vdev_ops == &vdev_mirror_ops ||
 		    vd->vdev_ops == &vdev_replacing_ops ||
 		    vd->vdev_ops == &vdev_spare_ops);
+
+		uint64_t max_segment = MIN(P2ROUNDUP(zfs_rebuild_max_segment,
+		    1 << vd->vdev_ashift), SPA_MAXBLOCKSIZE);
 
 		max_asize = vdev_psize_to_asize(vd, max_segment);
 		chunk_size = MIN(size, max_asize);
@@ -1152,6 +1154,8 @@ vdev_rebuild_get_stats(vdev_t *tvd, vdev_rebuild_stat_t *vrs)
 }
 
 /* BEGIN CSTYLED */
+ZFS_MODULE_PARAM(zfs, zfs_, rebuild_queue_limit, UINT, ZMOD_RW,
+        "Max rebuild queue limit");
 ZFS_MODULE_PARAM(zfs, zfs_, rebuild_max_segment, ULONG, ZMOD_RW,
         "Max segment size in bytes of rebuild reads");
 /* END CSTYLED */
