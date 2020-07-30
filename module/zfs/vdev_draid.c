@@ -729,6 +729,8 @@ vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size)
 
 		if (vdev_draid_vd_degraded(cvd, physical_offset))
 			return (B_TRUE);
+		if (!vdev_dtl_empty(cvd, DTL_PARTIAL))
+			return (B_TRUE);
 	}
 
 	return (B_FALSE);
@@ -994,10 +996,10 @@ vdev_draid_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
 	uint64_t offset = DVA_GET_OFFSET(dva);
 
-	if (!vdev_draid_group_degraded(vd, offset, psize))
-		return (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1));
+	if (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
+		return (!vdev_draid_group_degraded(vd, offset, psize));
 
-	return (B_TRUE);
+	return (B_FALSE);
 }
 
 static void
