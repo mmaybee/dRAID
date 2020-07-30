@@ -119,22 +119,6 @@ unsigned long zfs_rebuild_max_segment = 1024 * 1024;
 static void vdev_rebuild_thread(void *arg);
 
 /*
- * Determine if the range is degraded and needs to be rebuilt given the list
- * of faulted child vdevs.  When vr_rebuild_all is set then all dRAID groups
- * must be rebuilt, it will always be set for mirror vdevs.
- */
-static boolean_t
-draid_group_degraded(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
-{
-	ASSERT(vr->vr_top_vdev->vdev_ops == &vdev_draid_ops);
-
-	if (vr->vr_rebuild_all == B_TRUE)
-		return (B_TRUE);
-
-	return (vdev_draid_group_degraded(vr->vr_top_vdev, start, size));
-}
-
-/*
  * Clear the per-vdev rebuild bytes value for a vdev tree.
  */
 static void
@@ -561,7 +545,7 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	 * it does not fall in a degraded dRAID group.
 	 */
 	if (vd->vdev_ops == &vdev_draid_ops &&
-	    !draid_group_degraded(vr, start, size)) {
+	    !vdev_draid_group_degraded(vd, start, size, 0)) {
 		return (0);
 	}
 

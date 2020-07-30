@@ -697,10 +697,11 @@ vdev_draid_faulted(vdev_t *vd, uint64_t offset)
 }
 
 static boolean_t
-vdev_draid_vd_degraded(vdev_t *vd, uint64_t offset)
+vdev_draid_vd_degraded(vdev_t *vd, uint64_t offset, uint64_t phys_birth)
 {
 	if (!vdev_draid_faulted(vd, offset))
-		return (!vdev_dtl_empty(vd, DTL_PARTIAL));
+		return (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1));
+
 	return (B_TRUE);
 }
 
@@ -708,7 +709,8 @@ vdev_draid_vd_degraded(vdev_t *vd, uint64_t offset)
  * Determine if the dRAID block at the logical offset is degraded.
  */
 boolean_t
-vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size)
+vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size,
+    uint64_t phys_birth)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
@@ -726,9 +728,10 @@ vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t size)
 		uint64_t cid = vdev_draid_permute_id(vdc, base, iter, c);
 		vdev_t *cvd = vd->vdev_child[cid];
 
-		if (vdev_draid_vd_degraded(cvd, physical_offset))
+		if (vdev_draid_vd_degraded(cvd, physical_offset, phys_birth))
 			return (B_TRUE);
-		if (!vdev_dtl_empty(cvd, DTL_PARTIAL))
+
+		if (vdev_dtl_contains(cvd, DTL_PARTIAL, phys_birth, 1))
 			return (B_TRUE);
 	}
 
@@ -999,7 +1002,8 @@ vdev_draid_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
 	uint64_t offset = DVA_GET_OFFSET(dva);
 
 	if (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
-		return (!vdev_draid_group_degraded(vd, offset, psize));
+		return (!vdev_draid_group_degraded(vd, offset, psize,
+		    phys_birth));
 
 	return (B_FALSE);
 }

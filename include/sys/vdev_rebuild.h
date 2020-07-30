@@ -70,7 +70,6 @@ typedef struct vdev_rebuild {
 	/* In-core state and progress */
 	uint64_t	vr_scan_offset[TXG_SIZE];
 	uint64_t	vr_prev_scan_time_ms;	/* any previous scan time */
-	boolean_t	vr_rebuild_all;		/* rebuild entire space map */
 
 	/* Per-rebuild pass statistics for calculating bandwidth */
 	uint64_t	vr_pass_start_time;
