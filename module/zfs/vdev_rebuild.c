@@ -468,29 +468,20 @@ vdev_rebuild_cb(zio_t *zio)
 }
 
 /*
- * Rebuild the data in this range by constructing a special dummy block
- * pointer for the given range.  It has no relation to any existing blocks
- * in the pool.  But by disabling checksum verification and issuing a scrub
- * I/O, parity can be rebuilt for fixed-width dRAID vdevs.  Mirrored vdevs
- * will replicate the block using any available mirror leaf vdevs.
+ * Initialize a minimal dummy block pointer for sequential rebuild.
  */
 static void
-vdev_rebuild_rebuild_block(vdev_rebuild_t *vr, uint64_t start, uint64_t asize,
-    uint64_t txg)
+vdev_rebuild_blkptr_init(blkptr_t *bp, vdev_t *vd, uint64_t start,
+    uint64_t asize)
 {
-	vdev_t *vd = vr->vr_top_vdev;
-	spa_t *spa = vd->vdev_spa;
-	uint64_t psize = asize;
-
 	ASSERT(vd->vdev_ops == &vdev_draid_ops ||
 	    vd->vdev_ops == &vdev_mirror_ops ||
 	    vd->vdev_ops == &vdev_replacing_ops ||
 	    vd->vdev_ops == &vdev_spare_ops);
 
-	if (vd->vdev_ops == &vdev_draid_ops)
-		psize = vdev_draid_asize_to_psize(vd, asize, start);
+	uint64_t psize = vd->vdev_ops == &vdev_draid_ops ?
+	    vdev_draid_asize_to_psize(vd, asize, start) : asize;
 
-	blkptr_t blk, *bp = &blk;
 	BP_ZERO(bp);
 
 	DVA_SET_VDEV(&bp->blk_dva[0], vd->vdev_id);
@@ -507,19 +498,6 @@ vdev_rebuild_rebuild_block(vdev_rebuild_t *vr, uint64_t start, uint64_t asize,
 	BP_SET_LEVEL(bp, 0);
 	BP_SET_DEDUP(bp, 0);
 	BP_SET_BYTEORDER(bp, ZFS_HOST_BYTEORDER);
-
-	/*
-	 * We increment the issued bytes by the asize rather than the psize
-	 * so the scanned and issued bytes may be directly compared.  This
-	 * is consistent with the scrub/resilver issued reporting.
-	 */
-	vr->vr_pass_bytes_issued += asize;
-	vr->vr_rebuild_phys.vrp_bytes_issued += asize;
-
-	zio_nowait(zio_read(spa->spa_txg_zio[txg & TXG_MASK], spa, bp,
-	    abd_alloc(psize, B_FALSE), psize, vdev_rebuild_cb, vr,
-	    ZIO_PRIORITY_REBUILD, ZIO_FLAG_RAW | ZIO_FLAG_CANFAIL |
-	    ZIO_FLAG_RESILVER, NULL));
 }
 
 /*
@@ -533,6 +511,7 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	uint64_t ms_id __maybe_unused = vr->vr_scan_msp->ms_id;
 	vdev_t *vd = vr->vr_top_vdev;
 	spa_t *spa = vd->vdev_spa;
+	blkptr_t blk;
 
 	ASSERT3U(ms_id, ==, start >> vd->vdev_ms_shift);
 	ASSERT3U(ms_id, ==, (start + size - 1) >> vd->vdev_ms_shift);
@@ -541,13 +520,15 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	vr->vr_rebuild_phys.vrp_bytes_scanned += size;
 
 	/*
-	 * There's no need to issue a rebuild I/O for this range if
-	 * it does not fall in a degraded dRAID group.
+	 * Rebuild the data in this range by constructing a special dummy block
+	 * pointer.  It has no relation to any existing blocks in the pool.
+	 * However, by disabling checksum verification and issuing a scrub IO
+	 * we can reconstruct and repair any children with missing data.
 	 */
-	if (vd->vdev_ops == &vdev_draid_ops &&
-	    !vdev_draid_group_degraded(vd, start, size, 0)) {
+	vdev_rebuild_blkptr_init(&blk, vd, start, size);
+
+	if (!vdev_dtl_need_resilver(vd, &blk.blk_dva[0], size, TXG_UNKNOWN))
 		return (0);
-	}
 
 	mutex_enter(&vd->vdev_rebuild_io_lock);
 
@@ -585,11 +566,17 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 		return (SET_ERROR(EINTR));
 	}
 	mutex_exit(&vd->vdev_rebuild_lock);
+	dmu_tx_commit(tx);
 
 	vr->vr_scan_offset[txg & TXG_MASK] = start + size;
-	vdev_rebuild_rebuild_block(vr, start, size, txg);
+	vr->vr_pass_bytes_issued += size;
+	vr->vr_rebuild_phys.vrp_bytes_issued += size;
 
-	dmu_tx_commit(tx);
+	uint64_t psize = BP_GET_PSIZE(&blk);
+	zio_nowait(zio_read(spa->spa_txg_zio[txg & TXG_MASK], spa, &blk,
+	    abd_alloc(psize, B_FALSE), psize, vdev_rebuild_cb, vr,
+	    ZIO_PRIORITY_REBUILD, ZIO_FLAG_RAW | ZIO_FLAG_CANFAIL |
+	    ZIO_FLAG_RESILVER, NULL));
 
 	return (0);
 }

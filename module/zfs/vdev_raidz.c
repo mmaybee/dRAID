@@ -2389,6 +2389,9 @@ vdev_raidz_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
 	/* The first column for this stripe. */
 	uint64_t f = b % dcols;
 
+	/* Unreachable by sequential resilver. */
+	ASSERT3U(phys_birth, !=, TXG_UNKNOWN);
+
 	if (!vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
 		return (B_FALSE);
 

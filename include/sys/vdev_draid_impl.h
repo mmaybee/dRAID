@@ -38,8 +38,6 @@
 extern "C" {
 #endif
 
-extern boolean_t vdev_draid_group_degraded(vdev_t *, uint64_t, uint64_t,
-    uint64_t);
 extern uint64_t vdev_draid_check_block(vdev_t *, uint64_t, uint64_t *);
 extern uint64_t vdev_draid_get_astart(vdev_t *, uint64_t);
 extern uint64_t vdev_draid_offset_to_group(vdev_t *, uint64_t);

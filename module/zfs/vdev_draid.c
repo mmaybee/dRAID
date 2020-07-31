@@ -703,22 +703,11 @@ vdev_draid_faulted(vdev_t *vd, uint64_t physical_offset)
 	    vd->vdev_ops == &vdev_spare_ops);
 }
 
-static boolean_t
-vdev_draid_vd_degraded(vdev_t *vd, uint64_t physical_offset,
-    uint64_t phys_birth)
-{
-	if (!vdev_draid_faulted(vd, physical_offset))
-		return (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1));
-
-	return (B_TRUE);
-}
-
 /*
  * Determine if the dRAID block at the logical offset is degraded.
  */
-boolean_t
-vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t psize,
-    uint64_t phys_birth)
+static boolean_t
+vdev_draid_group_degraded(vdev_t *vd, uint64_t offset)
 {
 	vdev_draid_config_t *vdc = vd->vdev_tsd;
 
@@ -736,10 +725,7 @@ vdev_draid_group_degraded(vdev_t *vd, uint64_t offset, uint64_t psize,
 		uint64_t cid = vdev_draid_permute_id(vdc, base, iter, c);
 		vdev_t *cvd = vd->vdev_child[cid];
 
-		if (vdev_draid_vd_degraded(cvd, physical_offset, phys_birth))
-			return (B_TRUE);
-
-		if (vdev_dtl_contains(cvd, DTL_PARTIAL, phys_birth, 1))
+		if (vdev_draid_faulted(cvd, physical_offset))
 			return (B_TRUE);
 	}
 
@@ -996,24 +982,57 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t max_segment)
 }
 
 /*
- * The DVA needs to be resilvered when:
- *   1. There are multiple active distributed spares.
- *      See the comment in vdev_draid_io_start(); or
- *   2. The DVA is within the missing range of the DTL; or
- *   3. The DVA is degraded and needs to be resilvered.
+ * Returns the number of active distributed spares in the dRAID vdev tree.
+ */
+static int
+vdev_draid_active_spares(vdev_t *vd)
+{
+	int spares = 0;
+
+	if (vd->vdev_ops == &vdev_draid_spare_ops)
+		return (1);
+
+	for (int c = 0; c < vd->vdev_children; c++)
+		spares += vdev_draid_active_spares(vd->vdev_child[c]);
+
+	return (spares);
+}
+
+/*
+ * Determine if any portion of the provided block resides on a child vdev
+ * with a dirty DTL and therefore needs to be resilvered.
  */
 static boolean_t
 vdev_draid_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
     uint64_t phys_birth)
 {
-	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
 	uint64_t offset = DVA_GET_OFFSET(dva);
 
-	if (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
-		return (!vdev_draid_group_degraded(vd, offset, psize,
-		    phys_birth));
+	/*
+	 * There are multiple active distributed spares, see the comment
+	 * in vdev_draid_io_start() for details.
+	 */
+	if (vdc->vdc_nspares > 1 && vdev_draid_active_spares(vd) > 1)
+		return (B_TRUE);
 
-	return (B_FALSE);
+	if (phys_birth == TXG_UNKNOWN) {
+		/*
+		 * Sequential resilver.  There is no meaningful phys_birth
+		 * for this block, we can only determine if block resides
+		 * in a degraded group in which case it must be resilvered.
+		 */
+		return (vdev_draid_group_degraded(vd, offset));
+	} else {
+		/*
+		 * Healing resilver.  TXGs not in DTL_PARTIAL are intact,
+		 * as are blocks in non-degraded groups.
+		 */
+		if (!vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
+			return (B_FALSE);
+
+		return (vdev_draid_group_degraded(vd, offset));
+	}
 }
 
 static void

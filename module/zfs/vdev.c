@@ -2625,6 +2625,10 @@ boolean_t
 vdev_default_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
     uint64_t phys_birth)
 {
+	/* Set by sequential resilver. */
+	if (phys_birth == TXG_UNKNOWN)
+		return (B_TRUE);
+
 	return (vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1));
 }
 
@@ -2888,7 +2892,7 @@ vdev_dtl_reassess(vdev_t *vd, uint64_t txg, uint64_t scrub_txg,
 		if (t == DTL_PARTIAL)
 			minref = 1;			/* i.e. non-zero */
 		else if (vd->vdev_nparity != 0)
-			minref = vd->vdev_nparity + 1;	/* RAID-Z */
+			minref = vd->vdev_nparity + 1;	/* RAID-Z, dRAID */
 		else
 			minref = vd->vdev_children;	/* any kind of mirror */
 		space_reftree_create(&reftree);
