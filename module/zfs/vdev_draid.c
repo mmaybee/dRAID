@@ -1552,10 +1552,6 @@ vdev_draid_spare_io_start(zio_t *zio)
 		return;
 	}
 
-	/* Distributed spare IO never crosses a slice boundary. */
-	IMPLY(zio->io_type != ZIO_TYPE_IOCTL, offset >> DRAID_ROWSHIFT ==
-	    (offset + zio->io_size - 1) >> DRAID_ROWSHIFT);
-
 	switch (zio->io_type) {
 	case ZIO_TYPE_IOCTL:
 		zio->io_error = vdev_draid_spare_ioctl(zio);
