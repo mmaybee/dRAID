@@ -310,16 +310,13 @@ struct vdev {
 	kthread_t	*vdev_rebuild_thread;
 	vdev_rebuild_t	vdev_rebuild_config;
 
-	/* For limiting outstanding I/Os (initialize, TRIM, rebuild) */
+	/* For limiting outstanding I/Os (initialize, TRIM) */
 	kmutex_t	vdev_initialize_io_lock;
 	kcondvar_t	vdev_initialize_io_cv;
 	uint64_t	vdev_initialize_inflight;
 	kmutex_t	vdev_trim_io_lock;
 	kcondvar_t	vdev_trim_io_cv;
 	uint64_t	vdev_trim_inflight[3];
-	kmutex_t	vdev_rebuild_io_lock;
-	kcondvar_t	vdev_rebuild_io_cv;
-	uint64_t	vdev_rebuild_inflight;
 
 	/*
 	 * Values stored in the config for an indirect or removing vdev.

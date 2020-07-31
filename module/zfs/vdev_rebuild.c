@@ -100,14 +100,6 @@
 
 
 /*
- * Maximum number of queued rebuild I/Os top-level vdev.  The number of
- * concurrent rebuild I/Os issued to the device is controlled by the
- * zfs_vdev_rebuild_min_active and zfs_vdev_rebuild_max_active module
- * options.
- */
-unsigned int zfs_rebuild_queue_limit = 32;
-
-/*
  * Size of rebuild reads; defaults to 1MiB per data disk and is capped at
  * SPA_MAXBLOCKSIZE.
  */
@@ -442,7 +434,7 @@ vdev_rebuild_cb(zio_t *zio)
 	vdev_rebuild_phys_t *vrp = &vr->vr_rebuild_phys;
 	vdev_t *vd = vr->vr_top_vdev;
 
-	mutex_enter(&vd->vdev_rebuild_io_lock);
+	mutex_enter(&vr->vr_io_lock);
 	if (zio->io_error == ENXIO && !vdev_writeable(vd)) {
 		/*
 		 * The I/O failed because the top-level vdev was unavailable.
@@ -459,10 +451,10 @@ vdev_rebuild_cb(zio_t *zio)
 
 	abd_free(zio->io_abd);
 
-	ASSERT3U(vd->vdev_rebuild_inflight, >, 0);
-	vd->vdev_rebuild_inflight--;
-	cv_broadcast(&vd->vdev_rebuild_io_cv);
-	mutex_exit(&vd->vdev_rebuild_io_lock);
+	ASSERT3U(vr->vr_bytes_inflight, >, 0);
+	vr->vr_bytes_inflight -= zio->io_size;
+	cv_broadcast(&vr->vr_io_cv);
+	mutex_exit(&vr->vr_io_lock);
 
 	spa_config_exit(vd->vdev_spa, SCL_STATE_ALL, vd);
 }
@@ -530,14 +522,15 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	if (!vdev_dtl_need_resilver(vd, &blk.blk_dva[0], size, TXG_UNKNOWN))
 		return (0);
 
-	mutex_enter(&vd->vdev_rebuild_io_lock);
+	mutex_enter(&vr->vr_io_lock);
 
 	/* Limit in flight rebuild I/Os */
-	while (vd->vdev_rebuild_inflight >= zfs_rebuild_queue_limit)
-		cv_wait(&vd->vdev_rebuild_io_cv, &vd->vdev_rebuild_io_lock);
+	while (vr->vr_bytes_inflight >= vr->vr_bytes_inflight_max)
+		cv_wait(&vr->vr_io_cv, &vr->vr_io_lock);
 
-	vd->vdev_rebuild_inflight++;
-	mutex_exit(&vd->vdev_rebuild_io_lock);
+	uint64_t psize = BP_GET_PSIZE(&blk);
+	vr->vr_bytes_inflight += psize;
+	mutex_exit(&vr->vr_io_lock);
 
 	dmu_tx_t *tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 	VERIFY0(dmu_tx_assign(tx, TXG_WAIT));
@@ -557,9 +550,9 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 
 	/* When exiting write out our progress. */
 	if (vdev_rebuild_should_stop(vd)) {
-		mutex_enter(&vd->vdev_rebuild_io_lock);
-		vd->vdev_rebuild_inflight--;
-		mutex_exit(&vd->vdev_rebuild_io_lock);
+		mutex_enter(&vr->vr_io_lock);
+		vr->vr_bytes_inflight -= psize;
+		mutex_exit(&vr->vr_io_lock);
 		spa_config_exit(vd->vdev_spa, SCL_STATE_ALL, vd);
 		mutex_exit(&vd->vdev_rebuild_lock);
 		dmu_tx_commit(tx);
@@ -572,7 +565,6 @@ vdev_rebuild_range(vdev_rebuild_t *vr, uint64_t start, uint64_t size)
 	vr->vr_pass_bytes_issued += size;
 	vr->vr_rebuild_phys.vrp_bytes_issued += size;
 
-	uint64_t psize = BP_GET_PSIZE(&blk);
 	zio_nowait(zio_read(spa->spa_txg_zio[txg & TXG_MASK], spa, &blk,
 	    abd_alloc(psize, B_FALSE), psize, vdev_rebuild_cb, vr,
 	    ZIO_PRIORITY_REBUILD, ZIO_FLAG_RAW | ZIO_FLAG_CANFAIL |
@@ -772,9 +764,15 @@ vdev_rebuild_thread(void *arg)
 	vr->vr_top_vdev = vd;
 	vr->vr_scan_msp = NULL;
 	vr->vr_scan_tree = range_tree_create(NULL, RANGE_SEG64, NULL, 0, 0);
+	mutex_init(&vr->vr_io_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&vr->vr_io_cv, NULL, CV_DEFAULT, NULL);
+
 	vr->vr_pass_start_time = gethrtime();
 	vr->vr_pass_bytes_scanned = 0;
 	vr->vr_pass_bytes_issued = 0;
+
+	vr->vr_bytes_inflight_max = MAX(1ULL << 20,
+	    zfs_scan_vdev_limit * vd->vdev_children);
 
 	uint64_t update_est_time = gethrtime();
 	vdev_rebuild_update_bytes_est(vd, 0);
@@ -876,11 +874,14 @@ vdev_rebuild_thread(void *arg)
 	spa_config_exit(spa, SCL_CONFIG, FTAG);
 
 	/* Wait for any remaining rebuild I/O to complete */
-	mutex_enter(&vd->vdev_rebuild_io_lock);
-	while (vd->vdev_rebuild_inflight > 0)
-		cv_wait(&vd->vdev_rebuild_io_cv, &vd->vdev_rebuild_io_lock);
+	mutex_enter(&vr->vr_io_lock);
+	while (vr->vr_bytes_inflight > 0)
+		cv_wait(&vr->vr_io_cv, &vr->vr_io_lock);
 
-	mutex_exit(&vd->vdev_rebuild_io_lock);
+	mutex_exit(&vr->vr_io_lock);
+
+	mutex_destroy(&vr->vr_io_lock);
+	cv_destroy(&vr->vr_io_cv);
 
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 
@@ -1125,8 +1126,6 @@ vdev_rebuild_get_stats(vdev_t *tvd, vdev_rebuild_stat_t *vrs)
 }
 
 /* BEGIN CSTYLED */
-ZFS_MODULE_PARAM(zfs, zfs_, rebuild_queue_limit, UINT, ZMOD_RW,
-        "Max rebuild queue limit");
 ZFS_MODULE_PARAM(zfs, zfs_, rebuild_max_segment, ULONG, ZMOD_RW,
         "Max segment size in bytes of rebuild reads");
 /* END CSTYLED */
