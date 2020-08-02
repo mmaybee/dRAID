@@ -742,7 +742,7 @@ vdev_draid_create_base_permutations(const uint8_t *perms,
 	uint64_t children = vdc->vdc_children, *base_perms;
 	size_t sz = sizeof (uint64_t) * vdc->vdc_nbases * children;
 
-	base_perms = kmem_alloc(sz, KM_SLEEP);
+	base_perms = vmem_alloc(sz, KM_SLEEP);
 	for (int i = 0; i < vdc->vdc_nbases; i++)
 		for (int j = 0; j < children; j++)
 			base_perms[i * children + j] = perms[i * children + j];
@@ -819,7 +819,7 @@ vdev_draid_config_destroy(vdev_draid_config_t *vdc)
 {
 	size_t sz = sizeof (uint64_t) * vdc->vdc_nbases * vdc->vdc_children;
 
-	kmem_free(vdc->vdc_base_perms, P2ROUNDUP(sz, PAGESIZE));
+	vmem_free(vdc->vdc_base_perms, P2ROUNDUP(sz, PAGESIZE));
 	kmem_free(vdc, sizeof (*vdc));
 }
 
