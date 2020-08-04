@@ -1852,7 +1852,7 @@ spa_version(spa_t *spa)
 boolean_t
 spa_deflate(spa_t *spa)
 {
-	return (spa->spa_deflate);
+	return (spa->spa_deflate > 0);
 }
 
 metaslab_class_t *
@@ -2058,7 +2058,7 @@ dva_get_dsize_sync(spa_t *spa, const dva_t *dva)
 
 	ASSERT(spa_config_held(spa, SCL_ALL, RW_READER) != 0);
 
-	if (asize != 0 && spa->spa_deflate) {
+	if (asize != 0 && spa->spa_deflate > 0) {
 		vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
 		if (vd != NULL)
 			dsize = (asize >> SPA_MINBLOCKSHIFT) *

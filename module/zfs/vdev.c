@@ -1714,17 +1714,21 @@ vdev_open_children_subset(vdev_t *vd, vdev_open_children_func_t *open_func)
 }
 
 /*
- * Compute the raidz-deflation ratio.  Note, we hard-code
- * in 128k (1 << 17) because it is the "typical" blocksize.
- * Even though SPA_MAXBLOCKSIZE changed, this algorithm can not change,
- * otherwise it would inconsistently account for existing bp's.
+ * Compute the raidz-deflation ratio.  Note, we used to hard-code
+ * in 128k (1 << 17) because it is/was the "typical" blocksize.
+ * The "typical" blocksize can now be set using zfs_deflate_shift.
+ * Once defined for a new pool, the value cannot be changed,
+ * otherwise we would inconsistently account for existing bp's.
  */
 static void
 vdev_set_deflate_ratio(vdev_t *vd)
 {
 	if (vd == vd->vdev_top && !vd->vdev_ishole && vd->vdev_ashift != 0) {
-		vd->vdev_deflate_ratio = (1 << 17) /
-		    (vdev_psize_to_asize(vd, 1 << 17) >> SPA_MINBLOCKSHIFT);
+		int typical = 1 << 17;
+		if (vd->vdev_spa->spa_deflate > vd->vdev_ashift)
+			typical = 1 << vd->vdev_spa->spa_deflate;
+		vd->vdev_deflate_ratio = typical /
+		    (vdev_psize_to_asize(vd, typical) >> SPA_MINBLOCKSHIFT);
 	}
 }
 
