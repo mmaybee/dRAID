@@ -94,10 +94,15 @@ The minimum number of devices in a raidz group is one more than the number of
 parity disks.
 The recommended number is between 3 and 9 to help increase performance.
 .It Sy draid , draid1 , draid2 , draid3
-A distributed version of raidz with integrated hot spares that allows faster
-rebuilds while retaining the benefits of raidz.
-Data and parity are organized in redundancy groups and distributed evenly over
-all of the devices.
+A distributed version of raidz with integrated hot spares that allows for
+faster resilvering.
+A draid vdev is constructed from multiple internal raidz groups, each with D
+data devices and P parity devices, which are distributed over the children.
+This allows all of the children to participate when resilvering.
+As a general rule the more devices in a draid the less time required to
+resilver to a distributed spare.
+Furthermore, a narrower stripe width (D+P) will improve resilver performance
+at the expense of total usable capacity.
 .Pp
 Like raidz a draid can have single-, double-, or triple-parity.  The
 .Sy draid1 ,
@@ -114,8 +119,6 @@ A draid with N disks of size X, D data disks, P parity level, and H distributed
 hot spares can hold approximately (N-H)*(D/(D+P))*X bytes and can withstand P
 device(s) failing before data integrity is compromised.
 The minimum number of devices in a draid is P+2.
-As a general rule the more devices included in the draid the faster it will
-be to rebuild to a distributed hot spare.
 .It Sy draid[<parity>][:<data><d|D>][:<children><c|C>][:<spares><s|S>]
 When a non-default draid configuration is required it can be specified by
 appending one or more of the following optional arguments to the
