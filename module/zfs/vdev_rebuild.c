@@ -106,6 +106,20 @@
 unsigned long zfs_rebuild_max_segment = 1024 * 1024;
 
 /*
+ * A large default value can be safely used here because the target segment
+ * size (i.e. IO size per leaf) is also large (1M).  This helps keep the
+ * queue depth short.  That said, the overall rational in the comment above
+ * zfs_scan_vdev_limit also appied here.
+ *
+ * 32MB was selected as the default value to acheive good performance with
+ * a large 90-drive dRAID HDD configuration (draid2:8d:90c:2s). A sequential
+ * rebuild was unable to saturate all of the drives using smaller values.
+ * With a value of 32MB the sequential resilver write rate was measured at
+ * 800MB/s sustained while rebuilding to a distributed spare.
+ */
+unsigned long zfs_rebuild_vdev_limit = 32 << 20;
+
+/*
  * For vdev_rebuild_initiate_sync() and vdev_rebuild_reset_sync().
  */
 static void vdev_rebuild_thread(void *arg);
@@ -772,7 +786,7 @@ vdev_rebuild_thread(void *arg)
 	vr->vr_pass_bytes_issued = 0;
 
 	vr->vr_bytes_inflight_max = MAX(1ULL << 20,
-	    zfs_scan_vdev_limit * vd->vdev_children);
+	    zfs_rebuild_vdev_limit * vd->vdev_children);
 
 	uint64_t update_est_time = gethrtime();
 	vdev_rebuild_update_bytes_est(vd, 0);
@@ -803,17 +817,27 @@ vdev_rebuild_thread(void *arg)
 
 		ASSERT0(range_tree_space(vr->vr_scan_tree));
 
-		/*
-		 * Disable any new allocations to this metaslab and wait
-		 * for any writes inflight to complete.  This is needed to
-		 * ensure all allocated ranges are rebuilt.
-		 */
+		/* Disable any new allocations to this metaslab */
 		metaslab_disable(msp);
 		spa_config_exit(spa, SCL_CONFIG, FTAG);
-		txg_wait_synced(dsl, 0);
 
 		mutex_enter(&msp->ms_sync_lock);
 		mutex_enter(&msp->ms_lock);
+
+		/*
+		 * If there are outstanding allocations wait for them to be
+		 * synced.  This is needed to ensure all allocated ranges are
+		 * on disk and therefore will be rebuilt.
+		 */
+		for (int j = 0; j < TXG_SIZE; j++) {
+			if (range_tree_space(msp->ms_allocating[j])) {
+				mutex_exit(&msp->ms_lock);
+				mutex_exit(&msp->ms_sync_lock);
+				txg_wait_synced(dsl, 0);
+				mutex_enter(&msp->ms_sync_lock);
+				mutex_enter(&msp->ms_lock);
+			}
+		}
 
 		/*
 		 * When a metaslab has been allocated from read its allocated
@@ -1127,5 +1151,8 @@ vdev_rebuild_get_stats(vdev_t *tvd, vdev_rebuild_stat_t *vrs)
 
 /* BEGIN CSTYLED */
 ZFS_MODULE_PARAM(zfs, zfs_, rebuild_max_segment, ULONG, ZMOD_RW,
-        "Max segment size in bytes of rebuild reads");
+	"Max segment size in bytes of rebuild reads");
+
+ZFS_MODULE_PARAM(zfs, zfs_, rebuild_vdev_limit, ULONG, ZMOD_RW,
+	"Max bytes in flight per leaf vdev for sequential resilvers");
 /* END CSTYLED */
