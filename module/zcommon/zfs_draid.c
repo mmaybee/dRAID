@@ -169,6 +169,27 @@ vdev_draid_name(char *name, int len, uint64_t data, uint64_t parity,
 }
 
 /*
+ * Output a dRAID top-level vdev name in to the provided buffer given
+ * the ZPOOL_CONFIG_DRAIDCFG nvlist_t.
+ */
+char *
+vdev_draid_name_nv(char *name, int len, nvlist_t *nv)
+{
+	uint64_t data, parity, spares, children;
+
+	VERIFY0(nvlist_lookup_uint64(nv, ZPOOL_CONFIG_DRAIDCFG_DATA,
+	    &data));
+	VERIFY0(nvlist_lookup_uint64(nv, ZPOOL_CONFIG_DRAIDCFG_PARITY,
+	    &parity));
+	VERIFY0(nvlist_lookup_uint64(nv, ZPOOL_CONFIG_DRAIDCFG_SPARES,
+	    &spares));
+	VERIFY0(nvlist_lookup_uint64(nv, ZPOOL_CONFIG_DRAIDCFG_CHILDREN,
+	    &children));
+
+	return (vdev_draid_name(name, len, data, parity, spares, children));
+}
+
+/*
  * Output a dRAID spare vdev name in to the provided buffer.
  */
 char *
@@ -449,7 +470,7 @@ is_broken(draid_map_t *map, int dev)
  * Evaluate how resilvering I/O will be distributed.
  */
 static int
-eval_resilver(draid_map_t *map, int print)
+eval_resilver(draid_map_t *map)
 {
 	int spare;
 	int ndevs = map->ndevs;
@@ -520,17 +541,6 @@ eval_resilver(draid_map_t *map, int print)
 			max_ios = reads[i] + writes[i];
 	}
 
-	if (print) {
-		printf("Reads:  ");
-		for (int i = 0; i < ndevs; i++)
-			printf(" %5.3f", ((double)reads[i] * ngroups) / nrows);
-		printf("\n");
-		printf("Writes: ");
-		for (int i = 0; i < ndevs; i++)
-			printf(" %5.3f", ((double)writes[i] * ngroups) / nrows);
-		printf("\n");
-	}
-
 	kmem_free(writes, sizeof (int) * ndevs);
 	kmem_free(reads, sizeof (int) * ndevs);
 
@@ -538,7 +548,7 @@ eval_resilver(draid_map_t *map, int print)
 }
 
 static double
-eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults, int print)
+eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults)
 {
 	int ios;
 	int worst1 = -1;
@@ -549,7 +559,7 @@ eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults, int print)
 	long max_ios = 0;
 	double val = 0;
 
-	VERIFY0(eval_resilver(map, 0)); /* not broken already */
+	VERIFY0(eval_resilver(map)); /* not broken already */
 	VERIFY(faults == 1 || faults == 2);
 
 	map->nbroken = faults;
@@ -558,7 +568,7 @@ eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults, int print)
 		map->broken[0] = f1;
 
 		if (faults < 2) {
-			ios = eval_resilver(map, 0); /* eval single failure */
+			ios = eval_resilver(map); /* eval single failure */
 			n++;
 			sum += ios;
 			sumsq += ios*ios;
@@ -570,7 +580,7 @@ eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults, int print)
 			for (int f2 = f1 + 1; f2 < map->ndevs; f2++) {
 				map->broken[1] = f2; /* use 2nd hot spare */
 
-				ios = eval_resilver(map, 0);
+				ios = eval_resilver(map);
 				n++;
 				sum += ios;
 				sumsq += ios*ios;
@@ -583,16 +593,6 @@ eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults, int print)
 		}
 	}
 	map->nbroken = 0;
-
-	if (print) {
-		map->nbroken = faults;
-		map->broken[0] = worst1;
-		map->broken[2] = worst2;
-
-		eval_resilver(map, 1);
-
-		map->nbroken = 0;
-	}
 
 	switch (eval) {
 	case DRAIDCFG_EVAL_WORST:
@@ -675,7 +675,7 @@ optimize_map(draid_map_t *map, draidcfg_eval_t eval, int faults)
 	double temp    = 100.0;
 	double alpha   = 0.995;
 	double epsilon = 0.001;
-	double val = eval_decluster(map, eval, faults, 0);
+	double val = eval_decluster(map, eval, faults);
 	int ups = 0;
 	int downs = 0;
 	int sames = 0;
@@ -686,7 +686,7 @@ optimize_map(draid_map_t *map, draidcfg_eval_t eval, int faults)
 
 		permute_map(map2, (int)temp);
 
-		double val2  = eval_decluster(map2, eval, faults, 0);
+		double val2  = eval_decluster(map2, eval, faults);
 		double delta = (val2 - val);
 
 		if (delta < 0 || exp(-10000 * delta / temp) > drand48()) {
@@ -724,11 +724,25 @@ optimize_map(draid_map_t *map, draidcfg_eval_t eval, int faults)
 }
 
 static void
-print_map_stats(draid_map_t *map, draidcfg_eval_t eval, int print_ios)
+score_map(vdev_draid_config_t *vdc, draid_map_t *map, draidcfg_eval_t eval)
 {
-	double score = eval_decluster(map, DRAIDCFG_EVAL_WORST, 1, 0);
+	double score_worst = eval_decluster(map, DRAIDCFG_EVAL_WORST, 1);
+	double score_mean = eval_decluster(map, DRAIDCFG_EVAL_MEAN, 1);
+	double score_rms = eval_decluster(map, DRAIDCFG_EVAL_RMS, 1);
+
+	/*
+	 * Single fault map scores for are added to the configuration to allow
+	 * for easy comparison.  See the comment above the draidcfg_eval_t
+	 * typedef for a brief explanation of how to interpret the score.
+	 * The original double is stored as a uint64_t by multiplying it
+	 * by 1000 then storing that value.
+	 */
+	vdc->vdc_scores[0] = (uint64_t)(score_worst * 1000.0);
+	vdc->vdc_scores[1] = (uint64_t)(score_mean * 1000.0);
+	vdc->vdc_scores[2] = (uint64_t)(score_rms * 1000.0);
 
 	if (draid_debug) {
+		double score = eval_decluster(map, eval, 1);
 		printf("%6s (%2d - %2d / %2d) x %5d: %2.3f\n",
 		    (eval == DRAIDCFG_EVAL_UNOPTIMIZED) ? "Unopt" :
 		    (eval == DRAIDCFG_EVAL_WORST) ? "Worst" :
@@ -743,18 +757,8 @@ print_map_stats(draid_map_t *map, draidcfg_eval_t eval, int print_ios)
 			    "imbalance!\n", score);
 		}
 
-		printf("Single: worst %6.3f mean %6.3f\n",
-		    eval_decluster(map, DRAIDCFG_EVAL_WORST, 1, 0),
-		    eval_decluster(map, DRAIDCFG_EVAL_MEAN, 1, 0));
-
-		printf("Double: worst %6.3f mean %6.3f\n",
-		    eval_decluster(map, DRAIDCFG_EVAL_WORST, 2, 0),
-		    eval_decluster(map, DRAIDCFG_EVAL_MEAN, 2, 0));
-	}
-
-	if (print_ios) {
-		eval_decluster(map, DRAIDCFG_EVAL_WORST, 1, 1);
-		eval_decluster(map, DRAIDCFG_EVAL_WORST, 2, 1);
+		printf("Single: worst %6.3f mean %6.3f rms %6.3f\n",
+		    score_worst, score_mean, score_rms);
 	}
 }
 
@@ -838,8 +842,8 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
 
 		map = new_map(ndevs, ngroups, nspares, nrows);
 		omap = optimize_map(dup_map(map), eval, faults);
-		if (eval_decluster(omap, eval, faults, 0) >
-		    eval_decluster(map, eval, faults, 0)) {
+		if (eval_decluster(omap, eval, faults) >
+		    eval_decluster(map, eval, faults)) {
 			/*
 			 * optimize_map() may create a worse map, because the
 			 * simulated annealing process may accept worse
@@ -852,8 +856,8 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
 		}
 
 		if (best_map == NULL ||
-		    eval_decluster(map, eval, faults, 0) <
-		    eval_decluster(best_map, eval, faults, 0)) {
+		    eval_decluster(map, eval, faults) <
+		    eval_decluster(best_map, eval, faults)) {
 			if (best_map != NULL)
 				free_map(best_map);
 			best_map = map;
@@ -895,9 +899,11 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
 			print_map(best_map);
 
 		dmap = develop_map(best_map);
+		score_map(vdc, dmap, eval);
+
 		free_map(best_map);
-		print_map_stats(dmap, eval, 0);
 		free_map(dmap);
+
 		return (0);
 	} else {
 		return (-1);
@@ -979,9 +985,9 @@ create_config(uint64_t data, uint64_t parity, uint64_t spares,
 	vdc->vdc_nparity = parity;
 	vdc->vdc_nspares = spares;
 	vdc->vdc_children = children;
-
 	vdc->vdc_nbases = 0;
 	vdc->vdc_base_perms = NULL;
+
 	if (draid_permutation_generate(vdc, passes, eval, faults) != 0) {
 		kmem_free(vdc, sizeof (vdev_draid_config_t));
 		return (NULL);
@@ -1107,18 +1113,22 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 	cfg = fnvlist_alloc();
 
 	/* Store the basic dRAID configuration. */
+	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_GUID, vdc->vdc_guid);
+	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_SEED, vdc->vdc_seed);
+	fnvlist_add_uint64_array(cfg, ZPOOL_CONFIG_DRAIDCFG_SCORES,
+	    (uint64_t *)vdc->vdc_scores, 3);
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_DATA, data);
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_PARITY, parity);
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_SPARES, spares);
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_CHILDREN, children);
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_GROUPS, groups);
-	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_GUID, vdc->vdc_guid);
-	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_SEED, vdc->vdc_seed);
 
 	/* Store the number of permutations followed by the permutations */
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_BASES, vdc->vdc_nbases);
-	value = kmem_zalloc(children * vdc->vdc_nbases * sizeof (uint8_t),
-	    KM_SLEEP);
+
+	int size = children * vdc->vdc_nbases * sizeof (uint8_t);
+	value = kmem_zalloc(size, KM_SLEEP);
+
 	for (int i = 0; i < vdc->vdc_nbases; i++) {
 		for (int j = 0; j < children; j++) {
 			uint64_t c = vdc->vdc_base_perms[i * children + j];
@@ -1129,7 +1139,7 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 	}
 	fnvlist_add_uint8_array(cfg, ZPOOL_CONFIG_DRAIDCFG_PERM,
 	    value, children * vdc->vdc_nbases);
-	kmem_free(value, children * vdc->vdc_nbases * sizeof (uint8_t));
+	kmem_free(value, size);
 
 	/*
 	 * Verify the generated configuration.  A failure indicates an
@@ -1234,19 +1244,31 @@ vdev_draid_config_read_file(const char *path, char *key, nvlist_t **cfg)
 
 /*
  * Write the provided dRAID configuration to the specified file path.
- * If a file already exists at the provided path the new configuration
- * will be added to it provided no matching key already exists.
+ * If a file already exists at the provided and append is set the new
+ * configuration will be added to it provided no matching key already
+ * exists.  Otherwise an error is returned.
  */
 int
-vdev_draid_config_write_file(const char *path, char *key, nvlist_t *cfg)
+vdev_draid_config_write_file(const char *path, char *key, nvlist_t *cfg,
+    boolean_t append)
 {
 	char tmppath[] = "/tmp/draid.cfg.XXXXXX";
 	nvlist_t *allcfgs;
 	int error, fd;
 
-	error = vdev_draid_config_read_file_impl(path, &allcfgs);
-	if (error != 0)
-		allcfgs = fnvlist_alloc();
+	if (append) {
+		error = vdev_draid_config_read_file_impl(path, &allcfgs);
+		if (error == ENOENT)
+			allcfgs = fnvlist_alloc();
+		else if (error != 0)
+			return (error);
+	} else {
+		struct stat64 st;
+		if (lstat64(path, &st) == 0)
+			return (EEXIST);
+		else
+			allcfgs = fnvlist_alloc();
+	}
 
 	error = nvlist_add_nvlist(allcfgs, key, cfg);
 	if (error) {

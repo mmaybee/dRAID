@@ -109,7 +109,8 @@ typedef struct vdev_draid_config {
 	 * Values read from the ZPOOL_CONFIG_DRAIDCFG nvlist.
 	 */
 	uint64_t vdc_guid;		/* unique identifier */
-	long int vdc_seed;		/* seed which generated permutations */
+	uint64_t vdc_seed;		/* seed which generated permutations */
+	uint64_t vdc_scores[3];		/* permutation scores worst/mean/rms */
 	uint64_t vdc_ndata;		/* # of data devices in group */
 	uint64_t vdc_nparity;		/* # of parity devices in group */
 	uint64_t vdc_nspares;		/* # of distributed spares */
@@ -170,6 +171,7 @@ extern draidcfg_err_t vdev_draid_config_validate(nvlist_t *, uint64_t,
     uint64_t, uint64_t, uint64_t);
 extern char *vdev_draid_name(char *, int, uint64_t, uint64_t, uint64_t,
     uint64_t);
+extern char *vdev_draid_name_nv(char *, int, nvlist_t *);
 extern char *vdev_draid_spare_name(char *, int, uint64_t, uint64_t, uint64_t);
 extern int vdev_draid_spare_values(const char *, uint64_t *, uint64_t *,
     uint64_t *);
@@ -184,6 +186,7 @@ extern boolean_t vdev_draid_is_spare(const char *);
  * Path to known dRAID configurations provided either by the upstream
  * OpenZFS project or a vendor.
  */
+#define	DRAIDCFG_DRYRUN_DIR	"/var/tmp"
 #define	DRAIDCFG_DEFAULT_DIR	"/etc/zfs/draid.d"
 #define	DRAIDCFG_DEFAULT_FILE	"defaults"
 
@@ -191,7 +194,8 @@ extern draidcfg_err_t vdev_draid_config_generate(uint64_t, uint64_t, uint64_t,
     uint64_t, int, draidcfg_eval_t, int, nvlist_t **);
 extern void vdev_draid_config_free(nvlist_t *);
 extern int vdev_draid_config_read_file(const char *, char *, nvlist_t **);
-extern int vdev_draid_config_write_file(const char *, char *, nvlist_t *);
+extern int vdev_draid_config_write_file(const char *, char *, nvlist_t *,
+    boolean_t);
 extern void vdev_draid_config_print_error(draidcfg_err_t);
 extern void vdev_draid_config_print(nvlist_t *);
 #endif

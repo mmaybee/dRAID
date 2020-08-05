@@ -761,6 +761,7 @@ typedef struct zpool_load_policy {
 /* dRAID configuration stored in ZPOOL_CONFIG_DRAIDCFG nvlist */
 #define	ZPOOL_CONFIG_DRAIDCFG_GUID	"draid_guid"
 #define	ZPOOL_CONFIG_DRAIDCFG_SEED	"draid_seed"
+#define	ZPOOL_CONFIG_DRAIDCFG_SCORES	"draid_scores"
 #define	ZPOOL_CONFIG_DRAIDCFG_DATA	"draid_data"
 #define	ZPOOL_CONFIG_DRAIDCFG_PARITY	"draid_parity"
 #define	ZPOOL_CONFIG_DRAIDCFG_SPARES	"draid_spares"

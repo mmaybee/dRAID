@@ -1300,16 +1300,16 @@ is_grouping(const char *type, int *mindev, int *maxdev)
  * but the dD/sS suffix is required.
  *
  * Defaults:
- * - Single parity
- * - Target group size of 12 (data + parity)
- * - Single distributed spare
+ * - Single parity,
+ * - 8 data devices per group,
+ * - Single distributed spare.
  *
  * Examples:
  * zpool create tank draid <devices...>
  * zpool create tank draid2:8d:1s <devices...>
  *
  * Highly optimized configurations can be developed by using the optional
- * syntax [:<passes><i|I>].  Performing more passes when developing the
+ * syntax [:<iterations><i|I>].  Performing more passes when developing the
  * configuration can slightly decrease the time required to complete a
  * distributed rebuild.  However, this will significantly increase the
  * time required to create a new pool.
@@ -1376,9 +1376,6 @@ draid_config_by_type(const char *type, uint64_t children)
 	if (data == 0)
 		data = MIN(children - spares - parity, VDEV_DRAID_TGT_DATA);
 
-
-	char fullpath[MAXPATHLEN];
-	char key[MAXNAMELEN];
 	nvlist_t *cfg = NULL;
 	draidcfg_err_t error;
 
@@ -1387,18 +1384,6 @@ draid_config_by_type(const char *type, uint64_t children)
 
 	switch (error) {
 	case DRAIDCFG_OK:
-		(void) vdev_draid_name(key, sizeof (key), data, parity,
-		    spares, children);
-		(void) snprintf(fullpath, MAXPATHLEN - 1, "%s/%s",
-		    DRAIDCFG_DEFAULT_DIR, key);
-
-		/*
-		 * Even though we couldn't write the new dRAID configuration
-		 * along side the other configurations this is not fatal.
-		 * The pool configuration is stored in the pool itself.
-		 */
-		(void) vdev_draid_config_write_file(fullpath, key, cfg);
-
 		return (cfg);
 	case DRAIDCFG_ERR_GROUPS_INVALID:
 		fprintf(stderr,

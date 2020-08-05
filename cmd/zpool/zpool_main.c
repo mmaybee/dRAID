@@ -53,6 +53,7 @@
 #include <pwd.h>
 #include <zone.h>
 #include <sys/wait.h>
+#include <zfs_draid.h>
 #include <zfs_prop.h>
 #include <sys/fs/zfs.h>
 #include <sys/stat.h>
@@ -802,6 +803,84 @@ add_prop_list_default(const char *propname, char *propval, nvlist_t **props,
 }
 
 /*
+ * For each top-level dRAID vdev save the generated configuration
+ * to a file.  Print the location of the saves filed and a message
+ * explaining they can be used to create a pool with the exact same
+ * layout by moving them to the /etc/zfs/draid.d/ directory.
+ */
+static void
+zpool_draid_cfg_dryrun(nvlist_t *nv)
+{
+	nvlist_t **child;
+	uint_t children;
+	boolean_t print_msg = B_TRUE;
+	int err;
+
+	err = nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_CHILDREN,
+	    &child, &children);
+	if (err != 0)
+		return;
+
+	for (int c = 0; c < children; c++) {
+		nvlist_t *top_nv = child[c];
+		nvlist_t *cfg;
+		char fullpath[MAXPATHLEN];
+		char key[MAXNAMELEN];
+		boolean_t duplicate_key = B_FALSE;
+
+		if (nvlist_lookup_nvlist(top_nv, ZPOOL_CONFIG_DRAIDCFG, &cfg))
+			continue;
+
+		(void) vdev_draid_name_nv(key, sizeof (key), cfg);
+
+		/* Skip if this is a duplicate configuration. */
+		for (int i = 0; i < c; i++) {
+			char i_key[MAXNAMELEN];
+			int i_len = sizeof (i_key);
+			nvlist_t *i_cfg;
+
+			if (nvlist_lookup_nvlist(top_nv,
+			    ZPOOL_CONFIG_DRAIDCFG, &i_cfg) != 0) {
+				continue;
+			}
+
+			(void) vdev_draid_name_nv(i_key, i_len, i_cfg);
+
+			if (strncmp(key, i_key, i_len) == 0) {
+				duplicate_key = B_TRUE;
+				break;
+			}
+		}
+
+		if (duplicate_key)
+			continue;
+
+		if (print_msg) {
+			(void) fprintf(stdout, gettext(
+			    "\nThe following dRAID configuration files were "
+			    "generated for the pool.\nManually copying these "
+			    "files into the %s directory will\nforce 'zpool "
+			    "create' to use this configuration when creating "
+			    "a new pool\nwith the same physical layout.\n\n"),
+			    DRAIDCFG_DEFAULT_DIR);
+			print_msg = B_FALSE;
+		}
+
+		(void) snprintf(fullpath, MAXPATHLEN - 1, "%s/%s",
+		    DRAIDCFG_DRYRUN_DIR, key);
+
+		err = vdev_draid_config_write_file(fullpath, key, cfg, B_FALSE);
+		if (err != 0) {
+			(void) fprintf(stderr, gettext("Cannot write dRAID "
+			    "config to '%s': %s\n"), fullpath, strerror(err));
+		} else {
+			(void) fprintf(stdout, gettext("\t%s\n"), fullpath);
+		}
+	}
+	fprintf(stdout, gettext("\n"));
+}
+
+/*
  * zpool add [-fgLnP] [-o property=value] <pool> <vdev> ...
  *
  *	-f	Force addition of devices, even if they appear in use
@@ -992,6 +1071,7 @@ zpool_do_add(int argc, char **argv)
 			}
 		}
 
+		zpool_draid_cfg_dryrun(poolnvroot);
 		ret = 0;
 	} else {
 		ret = (zpool_add(zhp, nvroot) != 0);
@@ -1549,6 +1629,7 @@ zpool_do_create(int argc, char **argv)
 		print_vdev_tree(NULL, "logs", nvroot, 0,
 		    VDEV_ALLOC_BIAS_LOG, 0);
 
+		zpool_draid_cfg_dryrun(nvroot);
 		ret = 0;
 	} else {
 		/*
