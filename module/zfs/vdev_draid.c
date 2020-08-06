@@ -129,16 +129,16 @@
 static vdev_t *vdev_draid_spare_get_child(vdev_t *vd, uint64_t offset);
 
 /*
- * Lookup the permutation base array and iteration id for the provided offset.
+ * Lookup the permutation array and iteration id for the provided offset.
  */
 static void
 vdev_draid_get_perm(vdev_draid_config_t *vdc, uint64_t pindex,
     uint64_t **base, uint64_t *iter)
 {
 	uint64_t ncols = vdc->vdc_children;
-	uint64_t poff = pindex % (vdc->vdc_nbases * ncols);
+	uint64_t poff = pindex % (vdc->vdc_nperms * ncols);
 
-	*base = vdc->vdc_base_perms + (poff / ncols) * ncols;
+	*base = vdc->vdc_perms + (poff / ncols) * ncols;
 	*iter = poff % ncols;
 }
 
@@ -736,14 +736,13 @@ vdev_draid_group_degraded(vdev_t *vd, uint64_t offset)
  * Allocate memory for and copy the dRAID base permutations.
  */
 static uint64_t *
-vdev_draid_create_base_permutations(const uint8_t *perms,
-    vdev_draid_config_t *vdc)
+vdev_draid_create_permutations(const uint8_t *perms, vdev_draid_config_t *vdc)
 {
 	uint64_t children = vdc->vdc_children, *base_perms;
-	size_t sz = sizeof (uint64_t) * vdc->vdc_nbases * children;
+	size_t sz = sizeof (uint64_t) * vdc->vdc_nperms * children;
 
 	base_perms = vmem_alloc(sz, KM_SLEEP);
-	for (int i = 0; i < vdc->vdc_nbases; i++)
+	for (int i = 0; i < vdc->vdc_nperms; i++)
 		for (int j = 0; j < children; j++)
 			base_perms[i * children + j] = perms[i * children + j];
 
@@ -785,11 +784,11 @@ vdev_draid_config_create(vdev_t *vd)
 	    ZPOOL_CONFIG_DRAIDCFG_CHILDREN);
 	vdc->vdc_ngroups = fnvlist_lookup_uint64(nvl,
 	    ZPOOL_CONFIG_DRAIDCFG_GROUPS);
-	vdc->vdc_nbases = fnvlist_lookup_uint64(nvl,
-	    ZPOOL_CONFIG_DRAIDCFG_BASES);
+	vdc->vdc_nperms = fnvlist_lookup_uint64(nvl,
+	    ZPOOL_CONFIG_DRAIDCFG_NPERMS);
 	VERIFY0(nvlist_lookup_uint8_array(nvl,
-	    ZPOOL_CONFIG_DRAIDCFG_PERM, &perms, &c));
-	vdc->vdc_base_perms = vdev_draid_create_base_permutations(perms, vdc);
+	    ZPOOL_CONFIG_DRAIDCFG_PERMS, &perms, &c));
+	vdc->vdc_perms = vdev_draid_create_permutations(perms, vdc);
 
 	/*
 	 * Derived constants.
@@ -817,9 +816,9 @@ vdev_draid_config_create(vdev_t *vd)
 static void
 vdev_draid_config_destroy(vdev_draid_config_t *vdc)
 {
-	size_t sz = sizeof (uint64_t) * vdc->vdc_nbases * vdc->vdc_children;
+	size_t sz = sizeof (uint64_t) * vdc->vdc_nperms * vdc->vdc_children;
 
-	vmem_free(vdc->vdc_base_perms, P2ROUNDUP(sz, PAGESIZE));
+	vmem_free(vdc->vdc_perms, P2ROUNDUP(sz, PAGESIZE));
 	kmem_free(vdc, sizeof (*vdc));
 }
 

@@ -3762,8 +3762,9 @@ dump_config_draid_perm_omit(nvlist_t *child)
 	if (nvlist_lookup_nvlist(child, ZPOOL_CONFIG_DRAIDCFG, &draid) != 0)
 		return;
 
-	nvlist_remove(draid, ZPOOL_CONFIG_DRAIDCFG_PERM, DATA_TYPE_UINT8_ARRAY);
-	nvlist_add_string(draid, ZPOOL_CONFIG_DRAIDCFG_PERM, "<omitted>");
+	nvlist_remove(draid, ZPOOL_CONFIG_DRAIDCFG_PERMS,
+	    DATA_TYPE_UINT8_ARRAY);
+	nvlist_add_string(draid, ZPOOL_CONFIG_DRAIDCFG_PERMS, "<omitted>");
 }
 
 /*

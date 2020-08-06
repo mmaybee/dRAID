@@ -102,11 +102,11 @@ vdev_draid_config_validate(nvlist_t *config,
 	}
 
 	/* Validate configuration base exists and is within range. */
-	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_BASES, &b))
-		return (DRAIDCFG_ERR_BASE_MISSING);
+	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_DRAIDCFG_NPERMS, &b))
+		return (DRAIDCFG_ERR_NPERMS_MISSING);
 
 	if (b == 0)
-		return (DRAIDCFG_ERR_BASE_INVALID);
+		return (DRAIDCFG_ERR_NPERMS_INVALID);
 
 	/*
 	 * Validate the minimum number of children exist per group for the
@@ -122,8 +122,8 @@ vdev_draid_config_validate(nvlist_t *config,
 		return (DRAIDCFG_ERR_LAYOUT);
 
 	if (nvlist_lookup_uint8_array(config,
-	    ZPOOL_CONFIG_DRAIDCFG_PERM, &perm, &c)) {
-		return (DRAIDCFG_ERR_PERM_MISSING);
+	    ZPOOL_CONFIG_DRAIDCFG_PERMS, &perm, &c)) {
+		return (DRAIDCFG_ERR_PERMS_MISSING);
 	}
 
 	/*
@@ -132,18 +132,18 @@ vdev_draid_config_validate(nvlist_t *config,
 	 * are no duplicates.
 	 */
 	if (c != b * n)
-		return (DRAIDCFG_ERR_PERM_MISMATCH);
+		return (DRAIDCFG_ERR_PERMS_MISMATCH);
 
 	for (uint64_t i = 0; i < b; i++) {
 		for (uint64_t j = 0; j < n; j++) {
 			uint64_t val = perm[i * n + j];
 
 			if (val >= n)
-				return (DRAIDCFG_ERR_PERM_INVALID);
+				return (DRAIDCFG_ERR_PERMS_INVALID);
 
 			for (uint64_t k = 0; k < j; k++) {
 				if (val == perm[i * n + k])
-					return (DRAIDCFG_ERR_PERM_DUPLICATE);
+					return (DRAIDCFG_ERR_PERMS_DUPLICATE);
 			}
 		}
 	}
@@ -249,33 +249,23 @@ vdev_draid_is_spare(const char *name)
 #include <math.h>
 #include <sys/stat.h>
 
-/*
- * Additional logging which can be useful to developers when working
- * on the internal dRAID implementation.
- */
-static int draid_debug = 0;
 
-typedef struct draid_map
-{
-	int  ngroups;
-	int *groupsz;
-	int  nspares;
-	int  ndevs;
-	int  nrows;
-	/* each row maps all drives, groups from 0, spares down from ndevs-1 */
-	int **rows;
-	int   nbroken; /* # broken drives */
-	int  *broken; /* which drives are broken */
+typedef struct draid_map {
+	uint64_t dm_nperms;	/* # of permutation rows */
+	uint64_t dm_children;	/* # of permuation columns */
+	uint64_t *dm_perms;	/* base permutation array */
 } draid_map_t;
 
-typedef struct draid_pair
-{
-	int  value;
-	int  order;
+typedef struct draid_pair {
+	int value;
+	int order;
 } draid_pair_t;
 
+/*
+ * Permute the values provided into a different order and store them in 'out'.
+ */
 static void
-permute_devs(int *in, int *out, int ndevs)
+permute_devs(uint64_t *in, uint64_t *out, int ndevs)
 {
 	/* Swap two devices */
 	if (ndevs == 2) {
@@ -285,7 +275,6 @@ permute_devs(int *in, int *out, int ndevs)
 		out[1] = i;
 		return;
 	}
-
 	int size = ndevs * sizeof (draid_pair_t);
 	draid_pair_t *tmp = kmem_alloc(size, KM_SLEEP);
 
@@ -312,287 +301,221 @@ permute_devs(int *in, int *out, int ndevs)
 	kmem_free(tmp, size);
 }
 
-static void
-print_map(draid_map_t *map)
-{
-	for (int i = 0; i < map->nrows; i++) {
-		for (int j = 0; j < map->ndevs; j++) {
-			if (j == map->ndevs - map->nspares)
-				printf("S ");
-
-			printf("%2d ", map->rows[i][j]);
-		}
-		printf("\n");
-	}
-}
-
-static void
+/*
+ * Verify the map is valid.
+ */
+static int
 check_map(draid_map_t *map)
 {
-	int nrows = map->nrows;
-	int ndevs = map->ndevs;
-	int **rows = map->rows;
+	uint64_t dev, devcounts[VDEV_DRAID_MAX_CHILDREN] = { 0 };
 
-	ASSERT3S(map->ngroups, <=, VDEV_DRAID_MAX_GROUPS);
-	ASSERT3S(map->nspares, <=, VDEV_DRAID_MAX_SPARES);
-	ASSERT3S(map->nrows, <=, VDEV_DRAID_MAX_ROWS);
-	ASSERT3S(map->nbroken, <=, VDEV_DRAID_MAX_SPARES);
-
-	/* Ensure each dev appears once in every row */
-	int *devcounts = kmem_zalloc(ndevs * sizeof (int), KM_SLEEP);
-
-	for (int i = 0; i < nrows; i++) {
-		int *row = rows[i];
-
-		for (int j = 0; j < ndevs; j++) {
-			int dev = row[j];
-
-			ASSERT3S(0, <=, dev);
-			ASSERT3S(dev, <, ndevs);
-			ASSERT3S(devcounts[dev], ==, i);
-			devcounts[dev] = i + 1;
+	/* Ensure each device index appears exactly once in every row */
+	for (int i = 0; i < map->dm_nperms; i++) {
+		for (int j = 0; j < map->dm_children; j++) {
+			dev = map->dm_perms[(i * map->dm_children) + j];
+			ASSERT3U(0, <=, dev);
+			ASSERT3U(dev, <, map->dm_children);
+			ASSERT3U(devcounts[dev], ==, i);
+			devcounts[dev]++;
 		}
 	}
-
-	kmem_free(devcounts, ndevs * sizeof (int));
-
-	/* Ensure broken drives only appear once */
-	int *brokencounts = kmem_zalloc(ndevs * sizeof (int), KM_SLEEP);
-
-	for (int i = 0; i < map->nbroken; i++) {
-		ASSERT3S(map->broken[i], >=, 0);
-		ASSERT3S(map->broken[i], <, ndevs);
-		ASSERT0(brokencounts[i]); /* not used already */
-		brokencounts[i] = 1;
-	}
-
-	kmem_free(brokencounts, ndevs * sizeof (int));
-}
-
-static draid_map_t *
-dup_map(draid_map_t *oldmap)
-{
-	draid_map_t *map = kmem_alloc(sizeof (draid_map_t), KM_SLEEP);
-	map->groupsz = kmem_alloc(sizeof (int) * oldmap->ngroups, KM_SLEEP);
-
-	for (int i = 0; i < oldmap->ngroups; i++)
-		map->groupsz[i] = oldmap->groupsz[i];
-
-	map->ngroups = oldmap->ngroups;
-	map->nspares = oldmap->nspares;
-	map->ndevs = oldmap->ndevs;
-	map->nrows = oldmap->nrows;
-	map->rows = kmem_alloc(sizeof (int *) * map->nrows, KM_SLEEP);
-
-	for (int i = 0; i < map->nrows; i++) {
-		map->rows[i] = kmem_alloc(sizeof (int) * map->ndevs, KM_SLEEP);
-		memcpy(map->rows[i], oldmap->rows[i],
-		    sizeof (int) * map->ndevs);
-	}
-
-	/* Initialize to no failures (nothing broken) */
-	map->broken = kmem_alloc(sizeof (int) * map->nspares, KM_SLEEP);
-	map->nbroken = 0;
-
-	check_map(map);
-
-	return (map);
-}
-
-static draid_map_t *
-new_map(int ndevs, int ngroups, int nspares, int nrows)
-{
-	draid_map_t *map = kmem_alloc(sizeof (draid_map_t), KM_SLEEP);
-	int groupsz = (ndevs - nspares) / ngroups;
-	int extra = (ndevs - nspares) % ngroups;
-
-	ASSERT3S(nrows, <=, VDEV_DRAID_MAX_ROWS);
-	ASSERT3S(ndevs, <=, (VDEV_DRAID_MAX_GROUPSIZE *
-	    VDEV_DRAID_MAX_GROUPS) + VDEV_DRAID_MAX_SPARES);
-
-	map->ngroups = ngroups;
-	map->groupsz = kmem_alloc(sizeof (int) * ngroups, KM_SLEEP);
-
-	for (int i = 0; i < ngroups; i++) {
-		map->groupsz[i] = groupsz;
-		if (i < extra) {
-			map->groupsz[i] += 1;
-		}
-	}
-
-	map->nspares = nspares;
-	map->ndevs = ndevs;
-	map->nrows = nrows;
-	map->rows = kmem_alloc(sizeof (int *) * nrows, KM_SLEEP);
-
-	for (int i = 0; i < nrows; i++) {
-		map->rows[i] = kmem_alloc(sizeof (int) * ndevs, KM_SLEEP);
-
-		if (i == 0) {
-			for (int j = 0; j < ndevs; j++) {
-				map->rows[i][j] = j;
-			}
-		} else {
-			permute_devs(map->rows[i-1], map->rows[i], ndevs);
-		}
-	}
-
-	/* Initialize to no failures (nothing broken) */
-	map->broken = kmem_alloc(sizeof (int) * nspares, KM_SLEEP);
-	map->nbroken = 0;
-
-	check_map(map);
-
-	return (map);
-}
-
-static void
-free_map(draid_map_t *map)
-{
-	kmem_free(map->broken, sizeof (int) * map->nspares);
-	for (int i = 0; i < map->nrows; i++)
-		kmem_free(map->rows[i], sizeof (int) * map->ndevs);
-	kmem_free(map->rows, sizeof (int *) * map->nrows);
-	kmem_free(map, sizeof (draid_map_t));
-}
-
-static inline int
-is_broken(draid_map_t *map, int dev)
-{
-	for (int i = 0; i < map->nbroken; i++)
-		if (dev == map->broken[i])
-			return (1);
 
 	return (0);
 }
 
 /*
- * Evaluate how resilvering I/O will be distributed.
+ * Allocate an empty permutation map.
  */
-static int
-eval_resilver(draid_map_t *map)
+static draid_map_t *
+alloc_map(uint64_t children, int nperms)
 {
-	int spare;
-	int ndevs = map->ndevs;
-	int nspares = map->nspares;
-	int ngroups = map->ngroups;
-	int groupsz;
-	int nrows = map->nrows;
-	int max_reads = 0;
-	int max_writes = 0;
-	int max_ios = 0;
+	draid_map_t *map = kmem_alloc(sizeof (draid_map_t), KM_SLEEP);
+	map->dm_children = children;
+	map->dm_nperms = nperms;
+	map->dm_perms = kmem_alloc(sizeof (uint64_t) * children * nperms,
+	    KM_SLEEP);
 
-	int *writes = kmem_zalloc(sizeof (int) * ndevs, KM_SLEEP);
-	int *reads = kmem_zalloc(sizeof (int) * ndevs, KM_SLEEP);
-
-	/* resilver all rows */
-	for (int i = 0; i < nrows; i++) {
-		int *row = map->rows[i];
-
-		/* resilver all groups with broken drives */
-		int index = 0;
-		for (int j = 0; j < ngroups; j++) {
-			int  fix = 0;
-
-			/* See if any disk in this group is broken */
-			groupsz = map->groupsz[j];
-			ASSERT3S(index, <, ndevs - groupsz);
-			for (int k = 0; k < groupsz && !fix; k++)
-				fix = is_broken(map, row[index + k]);
-
-			if (!fix) {
-				index += groupsz;
-				continue;
-			}
-
-			/*
-			 * This group needs fixing
-			 * Read all the non-broken drives and write all the
-			 * broken drives to their hot spare for this row
-			 */
-			spare = ndevs - nspares;
-			for (int k = 0; k < groupsz; k++) {
-				int dev = row[index+k];
-
-				if (!is_broken(map, dev)) {
-					reads[dev]++;
-				} else {
-					ASSERT3S(spare, <, ndevs);
-
-					while (is_broken(map, row[spare])) {
-						spare++;
-						ASSERT3S(spare, <, ndevs);
-					}
-					writes[row[spare++]]++;
-				}
-			}
-			index += groupsz;
-		}
-	}
-
-	/* find drives with most I/O */
-	for (int i = 0; i < ndevs; i++) {
-		if (reads[i] > max_reads)
-			max_reads = reads[i];
-		if (writes[i] > max_writes)
-			max_writes = writes[i];
-
-		if (reads[i] + writes[i] > max_ios)
-			max_ios = reads[i] + writes[i];
-	}
-
-	kmem_free(writes, sizeof (int) * ndevs);
-	kmem_free(reads, sizeof (int) * ndevs);
-
-	return (max_ios);
+	return (map);
 }
 
-static double
-eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults)
+/*
+ * Free a permutation map.
+ */
+static void
+free_map(draid_map_t *map)
 {
-	int ios;
-	int worst1 = -1;
-	int worst2 = -1;
-	int n = 0;
-	long sum = 0;
-	long sumsq = 0;
-	long max_ios = 0;
-	double val = 0;
+	kmem_free(map->dm_perms, sizeof (uint64_t) *
+	    map->dm_children * map->dm_nperms);
+	kmem_free(map, sizeof (draid_map_t));
+}
 
-	VERIFY0(eval_resilver(map)); /* not broken already */
-	VERIFY(faults == 1 || faults == 2);
+/*
+ * Duplicate a permutation map.
+ */
+static draid_map_t *
+dup_map(draid_map_t *oldmap)
+{
+	draid_map_t *newmap;
 
-	map->nbroken = faults;
+	newmap = alloc_map(oldmap->dm_children, oldmap->dm_nperms);
+	newmap->dm_children = oldmap->dm_children;
+	newmap->dm_nperms = oldmap->dm_nperms;
+	memcpy(newmap->dm_perms, oldmap->dm_perms,
+	    sizeof (uint64_t) * oldmap->dm_children * oldmap->dm_nperms);
 
-	for (int f1 = 0; f1 < map->ndevs; f1++) {
-		map->broken[0] = f1;
+	ASSERT0(check_map(newmap));
 
-		if (faults < 2) {
-			ios = eval_resilver(map); /* eval single failure */
-			n++;
-			sum += ios;
-			sumsq += ios*ios;
-			if (max_ios < ios) {
-				worst1 = f1;
-				max_ios = ios;
+	return (newmap);
+}
+
+/*
+ * Check if dev is in the provided list of faulted devices.
+ */
+static inline boolean_t
+is_faulted(int *faulted_devs, int nfaulted, int dev)
+{
+	for (int i = 0; i < nfaulted; i++)
+		if (faulted_devs[i] == dev)
+			return (B_TRUE);
+
+	return (B_FALSE);
+}
+
+/*
+ * Evaluate how resilvering I/O will be distributed given a list of faulted
+ * vdevs.  As a simplification we assume one IO is sufficient to repair each
+ * damaged device in a group.  The total numbers of read and write IOs to
+ * repair all degraded groups for all rows is stored in total_required_ios.
+ * The max_child_ios argument is the largest number of IO which must be
+ * preformed by a child.  For an ideally balanced layout this means that;
+ * max_child_ios * children ~= total_required_ios.
+ */
+static void
+eval_resilver(vdev_draid_config_t *vdc, draid_map_t *map, int *faulted_devs,
+    int nfaulted, int *max_child_ios, int *total_required_ios)
+{
+	uint64_t groupwidth = vdc->vdc_groupwidth;
+	uint64_t ngroups = vdc->vdc_ngroups;
+	uint64_t nspares = vdc->vdc_nspares;
+	uint64_t ndisks = vdc->vdc_ndisks;
+
+	int *ios = kmem_zalloc(sizeof (uint64_t) * map->dm_children, KM_SLEEP);
+
+	/* resilver all rows */
+	for (int i = 0; i < map->dm_nperms; i++) {
+		uint64_t *row = &map->dm_perms[i * map->dm_children];
+
+		/* resilver all groups with faulted drives */
+		for (int j = 0; j < ngroups; j++) {
+			uint64_t spareidx = map->dm_children - nspares;
+			boolean_t repair_needed = B_FALSE;
+
+			/* See if any devices in this group are faulted */
+			int groupstart = (j * groupwidth) % ndisks;
+
+			for (int k = 0; k < groupwidth; k++) {
+				int groupidx = (groupstart + k) % ndisks;
+
+				repair_needed = is_faulted(faulted_devs,
+				    nfaulted, row[groupidx]);
+				if (repair_needed)
+					break;
 			}
-		} else { /* eval double failure */
-			for (int f2 = f1 + 1; f2 < map->ndevs; f2++) {
-				map->broken[1] = f2; /* use 2nd hot spare */
 
-				ios = eval_resilver(map);
-				n++;
-				sum += ios;
-				sumsq += ios*ios;
-				if (max_ios < ios) {
-					worst1 = f1;
-					worst2 = f2;
-					max_ios = ios;
+			if (repair_needed == B_FALSE)
+				continue;
+
+			/*
+			 * This group is degraded. Calculate the number of
+			 * reads the non-faulted drives require and the number
+			 * of writes to the distributed hot spare for this row.
+			 */
+			for (int k = 0; k < groupwidth; k++) {
+				int groupidx = (groupstart + k) % ndisks;
+
+				if (!is_faulted(faulted_devs, nfaulted,
+				    row[groupidx])) {
+					ios[row[groupidx]]++;
+				} else {
+					while (is_faulted(faulted_devs,
+					    nfaulted, row[spareidx])) {
+						spareidx++;
+					}
+
+					ASSERT3U(spareidx, <, map->dm_children);
+					ios[row[spareidx]]++;
+					spareidx++;
 				}
 			}
 		}
 	}
-	map->nbroken = 0;
+
+	*max_child_ios = 0;
+	*total_required_ios = 0;
+
+	/* Find the drives with most I/O required */
+	for (int i = 0; i < map->dm_children; i++) {
+		if (ios[i] > *max_child_ios)
+			*max_child_ios = ios[i];
+
+		*total_required_ios += ios[i];
+	}
+
+	kmem_free(ios, sizeof (uint64_t) * map->dm_children);
+}
+
+/*
+ * Evaluate the permutation mapping for all possible device failures.
+ */
+static double
+eval_decluster(vdev_draid_config_t *vdc, draid_map_t *map, draidcfg_eval_t eval,
+    int faults)
+{
+	int child_ios, required_ios;
+	int n = 0, max_child_ios = 0, total_required_ios = 0;
+	long sum = 0;
+	long sumsq = 0;
+	int faulted_devs[2];
+
+	/* Only consider up to two simultaneous faults. */
+	VERIFY3S(faults, >, 0);
+	VERIFY3S(faults, <=, 2);
+
+	for (int f1 = 0; f1 < map->dm_children; f1++) {
+		faulted_devs[0] = f1;
+
+		if (faults == 1) {
+			/* Evaluate single failure */
+			eval_resilver(vdc, map, faulted_devs, faults,
+			    &child_ios, &required_ios);
+			if (max_child_ios < child_ios)
+				max_child_ios = child_ios;
+
+			sum += child_ios;
+			sumsq += child_ios * child_ios;
+			total_required_ios += required_ios;
+			n++;
+
+			continue;
+		} else if (faults == 2) {
+			/* Evaluate double failure */
+			for (int f2 = f1 + 1; f2 < map->dm_children; f2++) {
+				faulted_devs[1] = f2;
+
+				eval_resilver(vdc, map, faulted_devs, faults,
+				    &child_ios, &total_required_ios);
+				if (max_child_ios < child_ios)
+					max_child_ios = child_ios;
+
+				sum += child_ios;
+				sumsq += child_ios * child_ios;
+				total_required_ios += required_ios;
+				n++;
+			}
+		}
+	}
+
+	double value = 0;
 
 	switch (eval) {
 	case DRAIDCFG_EVAL_WORST:
@@ -600,166 +523,64 @@ eval_decluster(draid_map_t *map, draidcfg_eval_t eval, int faults)
 		 * Imbalance from worst possible drive failure
 		 * insensitive to failures handled better.
 		 */
-		val = max_ios;
+		value = max_child_ios;
 		break;
 	case DRAIDCFG_EVAL_MEAN:
 		/*
 		 * Average over all possible drive failures
 		 * sensitive to all possible failures.
 		 */
-		val = ((double)sum) / n;
+		value = ((double)sum) / n;
 		break;
 	case DRAIDCFG_EVAL_RMS:
 		/*
 		 * Root mean square over all possible drive failures
 		 * penalizes higher imbalance more.
 		 */
-		val = sqrt(((double)sumsq) / n);
+		value = sqrt(((double)sumsq) / n);
 		break;
 	default:
 		VERIFY(0);
 	}
 
-	return ((val / map->nrows) * map->ngroups);
+	/* Average number of resilver IOs per child. */
+	double child_avg = (total_required_ios / n) / map->dm_children;
+
+	return (value / child_avg);
 }
 
+/*
+ * Return a random vaule in the requested range.
+ */
 static int
 rand_in_range(int min, int count)
 {
 	return (min + drand48() * count);
 }
 
+/*
+ * Permute a random percentage of rows in the map.
+ */
 static void
-permute_map(draid_map_t *map, int temp)
+permute_map(draid_map_t *map, int percent)
 {
-	static int prev_temp;
+	int nperms, row;
 
-	int nrows = (temp < 1) ? 1 : (temp > 100) ?
-	    map->nrows : rand_in_range(1, (map->nrows * temp) / 100);
-	int row = rand_in_range(0, map->nrows - nrows);
-	int ncols = map->ndevs;
-	int col = rand_in_range(0, map->ndevs - ncols);
-
-	if (draid_debug > 0 && temp != prev_temp &&
-	    (temp < 10 || (temp % 10 == 0))) {
-		printf("Permute t %3d (%d-%d, %d-%d)\n",
-		    temp, col, ncols, row, nrows);
-	}
-	prev_temp = temp;
-
-	for (int i = row; i < row + nrows; i++)
-		permute_devs(&map->rows[i][col], &map->rows[i][col], ncols);
-}
-
-static draid_map_t *
-develop_map(draid_map_t *map)
-{
-	draid_map_t *dmap = new_map(map->ndevs, map->ngroups,
-	    map->nspares, map->nrows * map->ndevs);
-
-	for (int base = 0; base < map->nrows; base++) {
-		for (int dev = 0; dev < map->ndevs; dev++) {
-			for (int i = 0; i < map->ndevs; i++) {
-				dmap->rows[base*map->ndevs + dev][i] =
-				    (map->rows[base][i] + dev) % map->ndevs;
-			}
-		}
+	/* Select a percentage of the total rows. */
+	if (percent < 1) {
+		nperms = 1;
+	} else if (percent > 100) {
+		nperms = map->dm_nperms;
+	} else {
+		nperms = rand_in_range(1, (map->dm_nperms * percent) / 100);
 	}
 
-	return (dmap);
-}
+	/* Select a random starting row. */
+	row = rand_in_range(0, map->dm_nperms - nperms);
 
-static draid_map_t *
-optimize_map(draid_map_t *map, draidcfg_eval_t eval, int faults)
-{
-	double temp    = 100.0;
-	double alpha   = 0.995;
-	double epsilon = 0.001;
-	double val = eval_decluster(map, eval, faults);
-	int ups = 0;
-	int downs = 0;
-	int sames = 0;
-	int iter = 0;
-
-	while (temp > epsilon) {
-		draid_map_t *map2 = dup_map(map);
-
-		permute_map(map2, (int)temp);
-
-		double val2  = eval_decluster(map2, eval, faults);
-		double delta = (val2 - val);
-
-		if (delta < 0 || exp(-10000 * delta / temp) > drand48()) {
-			if (delta > 0)
-				ups++;
-			else if (delta < 0)
-				downs++;
-			else
-				sames++;
-
-			free_map(map);
-			map = map2;
-			val = val2;
-		} else {
-			free_map(map2);
-		}
-
-		temp *= alpha;
-
-		if ((++iter % 100) == 0) {
-			if (draid_debug > 0) {
-				printf("%f (%d ups, %d sames, %d downs)\n",
-				    val, ups, sames, downs);
-			}
-			ups = downs = sames = 0;
-		}
-	}
-
-	if (draid_debug > 0) {
-		printf("%d iters, %d ups %d sames %d downs\n",
-		    iter, ups, sames, downs);
-	}
-
-	return (map);
-}
-
-static void
-score_map(vdev_draid_config_t *vdc, draid_map_t *map, draidcfg_eval_t eval)
-{
-	double score_worst = eval_decluster(map, DRAIDCFG_EVAL_WORST, 1);
-	double score_mean = eval_decluster(map, DRAIDCFG_EVAL_MEAN, 1);
-	double score_rms = eval_decluster(map, DRAIDCFG_EVAL_RMS, 1);
-
-	/*
-	 * Single fault map scores for are added to the configuration to allow
-	 * for easy comparison.  See the comment above the draidcfg_eval_t
-	 * typedef for a brief explanation of how to interpret the score.
-	 * The original double is stored as a uint64_t by multiplying it
-	 * by 1000 then storing that value.
-	 */
-	vdc->vdc_scores[0] = (uint64_t)(score_worst * 1000.0);
-	vdc->vdc_scores[1] = (uint64_t)(score_mean * 1000.0);
-	vdc->vdc_scores[2] = (uint64_t)(score_rms * 1000.0);
-
-	if (draid_debug) {
-		double score = eval_decluster(map, eval, 1);
-		printf("%6s (%2d - %2d / %2d) x %5d: %2.3f\n",
-		    (eval == DRAIDCFG_EVAL_UNOPTIMIZED) ? "Unopt" :
-		    (eval == DRAIDCFG_EVAL_WORST) ? "Worst" :
-		    (eval == DRAIDCFG_EVAL_MEAN) ? "Mean"  : "Rms",
-		    map->ndevs, map->nspares, map->ngroups, map->nrows, score);
-
-		if (map->ndevs < 80 && score >= 1.05) {
-			printf("Warning score %6.3f has over 5 percent "
-			    "imbalance!\n", score);
-		} else if (score >= 1.1) {
-			printf("Warning score %6.3f has over 10 percent "
-			    "imbalance!\n", score);
-		}
-
-		printf("Single: worst %6.3f mean %6.3f rms %6.3f\n",
-		    score_worst, score_mean, score_rms);
-	}
+	for (int i = row; i < row + nperms; i++)
+		permute_devs(&map->dm_perms[i * map->dm_children],
+		    &map->dm_perms[i * map->dm_children], map->dm_children);
 }
 
 static int
@@ -782,14 +603,97 @@ get_urandom(uint8_t *buf, size_t bytes)
 	return (bytes_read);
 }
 
+/*
+ * Optimize the map to evenly distribute IO over the children when
+ * resilvering to a distributed spare.
+ */
+static draid_map_t *
+optimize_map(vdev_draid_config_t *vdc, draid_map_t *map, draidcfg_eval_t eval,
+    int faults)
+{
+	double temp = 100.0;
+	double alpha = 0.995;
+	double epsilon = 0.001;
+	double score = eval_decluster(vdc, map, eval, faults);
+
+	while (temp > epsilon) {
+		draid_map_t *pmap = dup_map(map);
+
+		permute_map(pmap, (int)temp);
+
+		double pscore = eval_decluster(vdc, map, eval, faults);
+		double delta = (pscore - score);
+
+		/*
+		 * Use the new map if it is an improvement.  On occasion
+		 * accept a worst map to avoid local optimaa
+		 */
+		if (delta < 0 || exp(-10000 * delta / temp) > drand48()) {
+			free_map(map);
+			map = pmap;
+			score = pscore;
+		} else {
+			free_map(pmap);
+		}
+
+		temp *= alpha;
+	}
+
+	return (map);
+}
+
+/*
+ * Generate a new candidate map for the vdc and optimized it.
+ */
+static draid_map_t *
+generate_map(vdev_draid_config_t *vdc, uint64_t nperms, draidcfg_eval_t eval,
+    int faults)
+{
+	uint64_t children = vdc->vdc_children;
+	draid_map_t *map = alloc_map(children, nperms);
+
+	/* Initialize the first row to a known pattern */
+	for (int i = 0; i < children; i++)
+		map->dm_perms[i] = i;
+
+	for (int i = 1; i < nperms; i++) {
+		uint64_t *prev_row = &map->dm_perms[(i - 1) * children];
+		uint64_t *curr_row = &map->dm_perms[i * children];
+
+		/* Permute the previous row to create the next row */
+		permute_devs(prev_row, curr_row, children);
+	}
+
+	ASSERT0(check_map(map));
+
+	/*
+	 * Optimize the map.
+	 */
+	draid_map_t *opt_map = dup_map(map);
+	opt_map = optimize_map(vdc, opt_map, eval, faults);
+
+	double score = eval_decluster(vdc, map, eval, faults);
+	double opt_score = eval_decluster(vdc, opt_map, eval, faults);
+
+	if (score > opt_score) {
+		/*
+		 * optimize_map() may create a worse map, because the
+		 * simulated annealing process may accept worse
+		 * neighbors to avoid getting stuck in local optima
+		 */
+		free_map(opt_map);
+		return (map);
+	} else {
+		free_map(map);
+		return (opt_map);
+	}
+}
+
+
 static int
 draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
     draidcfg_eval_t eval, int faults)
 {
-	int nspares = vdc->vdc_nspares;
-	int ngroups = vdc->vdc_ngroups;
-	int ndevs = vdc->vdc_children;
-	uint64_t guid;
 	long int best_seed = 0;
 	draid_map_t *best_map = NULL;
 	int i;
@@ -815,49 +719,30 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
 	 *  leaf vdevs:  255    210 bytes average
 	 *                      212 bytes largest
 	 */
-	int nrows = 32;
-
-	/*
-	 * A unique guid which can be used to identify the map.
-	 */
-	if (get_urandom((void *)&guid, sizeof (guid)) != sizeof (guid))
-		return (-1);
+	int nperms = 64;
 
 	/*
 	 * Perform the requested number of passes progressively developing
 	 * the map by randomly permuting it.  The best version is kept.
 	 */
 	for (i = 0; i < passes; i++) {
-		draid_map_t *map, *omap;
 		long int seed;
 
 		/*
 		 * Generate a random seed to be used to create the map.
 		 * /dev/urandom provides sufficient randomness for this.
 		 */
-		if (get_urandom((void *)&seed, sizeof (seed)) != sizeof (seed))
-			break;
-
+		(void) get_urandom((void *)&seed, sizeof (seed));
 		srand48(seed);
 
-		map = new_map(ndevs, ngroups, nspares, nrows);
-		omap = optimize_map(dup_map(map), eval, faults);
-		if (eval_decluster(omap, eval, faults) >
-		    eval_decluster(map, eval, faults)) {
-			/*
-			 * optimize_map() may create a worse map, because the
-			 * simulated annealing process may accept worse
-			 * neighbors to avoid getting stuck in local optima
-			 */
-			free_map(omap);
-		} else {
-			free_map(map);
-			map = omap;
-		}
+		/*
+		 * Generate a new random candidate map.
+		 */
+		draid_map_t *map = generate_map(vdc, nperms, eval, faults);
 
 		if (best_map == NULL ||
-		    eval_decluster(map, eval, faults) <
-		    eval_decluster(best_map, eval, faults)) {
+		    eval_decluster(vdc, map, eval, faults) <
+		    eval_decluster(vdc, best_map, eval, faults)) {
 			if (best_map != NULL)
 				free_map(best_map);
 			best_map = map;
@@ -867,42 +752,30 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
 		}
 	}
 
-	if (draid_debug && (i != passes)) {
-		fprintf(stderr, "Early termination at pass %d. Generated "
-		    "permutations may not be optimal!\n", i + 1);
-	}
-
 	if (best_map != NULL) {
-		draid_map_t *dmap;
-		uint64_t *perms;
-
 		ASSERT3S(best_seed, !=, 0);
-		ASSERT3S(best_map->nrows, ==, nrows);
-		ASSERT3S(best_map->ndevs, ==, vdc->vdc_children);
+		ASSERT3S(best_map->dm_nperms, ==, nperms);
+		ASSERT3S(best_map->dm_children, ==, vdc->vdc_children);
 
-		perms = kmem_alloc(sizeof (*perms) * nrows * best_map->ndevs,
-		    KM_SLEEP);
-
-		for (i = 0; i < nrows; i++) {
-			for (int j = 0; j < best_map->ndevs; j++) {
-				perms[i * best_map->ndevs + j] =
-				    best_map->rows[i][j];
-			}
-		}
-
-		vdc->vdc_guid = guid;
-		vdc->vdc_nbases = nrows;
-		vdc->vdc_base_perms = perms;
 		vdc->vdc_seed = best_seed;
+		vdc->vdc_nperms = best_map->dm_nperms;
+		vdc->vdc_perms = best_map->dm_perms;
 
-		if (draid_debug > 1)
-			print_map(best_map);
+		/*
+		 * Single fault map scores for are added to the configuration
+		 * to allow for easy assessment of the map quality.  See the
+		 * comment above the draidcfg_eval_t typedef for a brief
+		 * explanation of how to interpret the scores.  The original
+		 * double is stored as a uint64_t by multiplying it by 1000.
+		 */
+		vdc->vdc_scores[0] = (uint64_t)(eval_decluster(vdc, best_map,
+		    DRAIDCFG_EVAL_WORST, 1) * 1000.0);
+		vdc->vdc_scores[1] = (uint64_t)(eval_decluster(vdc, best_map,
+		    DRAIDCFG_EVAL_MEAN, 1) * 1000.0);
+		vdc->vdc_scores[2] = (uint64_t)(eval_decluster(vdc, best_map,
+		    DRAIDCFG_EVAL_RMS, 1) * 1000.0);
 
-		dmap = develop_map(best_map);
-		score_map(vdc, dmap, eval);
-
-		free_map(best_map);
-		free_map(dmap);
+		kmem_free(best_map, sizeof (draid_map_t));
 
 		return (0);
 	} else {
@@ -919,10 +792,10 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
  */
 static nvlist_t *
 find_known_config(uint64_t data, uint64_t parity, uint64_t spares,
-    uint64_t children)
+    uint64_t children, char *fullpath)
 {
 	char *dirpath = DRAIDCFG_DEFAULT_DIR;
-	char *fullpath, key[MAXNAMELEN];
+	char key[MAXNAMELEN];
 	struct dirent *ent;
 	nvlist_t *default_cfg = NULL;
 	nvlist_t *vendor_cfg = NULL;
@@ -931,12 +804,6 @@ find_known_config(uint64_t data, uint64_t parity, uint64_t spares,
 	DIR *dir = opendir(dirpath);
 	if (dir == NULL)
 		return (NULL);
-
-	fullpath = kmem_zalloc(MAXPATHLEN, KM_SLEEP);
-	if (fullpath == NULL) {
-		closedir(dir);
-		return (NULL);
-	}
 
 	while ((ent = readdir(dir)) != NULL) {
 		(void) snprintf(fullpath, MAXPATHLEN - 1, "%s/%s",
@@ -957,14 +824,12 @@ find_known_config(uint64_t data, uint64_t parity, uint64_t spares,
 			    &vendor_cfg);
 			if (error == 0) {
 				nvlist_free(default_cfg);
-				kmem_free(fullpath, MAXPATHLEN);
 				closedir(dir);
 				return (vendor_cfg);
 			}
 		}
 	}
 
-	kmem_free(fullpath, MAXPATHLEN);
 	closedir(dir);
 
 	return (default_cfg);
@@ -972,7 +837,8 @@ find_known_config(uint64_t data, uint64_t parity, uint64_t spares,
 
 static vdev_draid_config_t *
 create_config(uint64_t data, uint64_t parity, uint64_t spares,
-    uint64_t children, int passes, draidcfg_eval_t eval, int faults)
+    uint64_t children, uint64_t ngroups, int passes, draidcfg_eval_t eval,
+    int faults)
 {
 	vdev_draid_config_t *vdc;
 
@@ -980,21 +846,42 @@ create_config(uint64_t data, uint64_t parity, uint64_t spares,
 	ASSERT3U(data + parity, <=, children - spares);
 
 	vdc = kmem_zalloc(sizeof (vdev_draid_config_t), KM_SLEEP);
-	vdc->vdc_ngroups = children - spares;
+
+	/*
+	 * A unique guid which can be used to identify the map.
+	 */
+	(void) get_urandom((void *)&vdc->vdc_guid, sizeof (uint64_t));
+
 	vdc->vdc_ndata = data;
 	vdc->vdc_nparity = parity;
 	vdc->vdc_nspares = spares;
 	vdc->vdc_children = children;
-	vdc->vdc_nbases = 0;
-	vdc->vdc_base_perms = NULL;
+	vdc->vdc_ngroups = ngroups;
 
+	/*
+	 * Derived constants.
+	 */
+	vdc->vdc_groupwidth = vdc->vdc_ndata + vdc->vdc_nparity;
+	vdc->vdc_ndisks = vdc->vdc_children - vdc->vdc_nspares;
+	vdc->vdc_groupsz = vdc->vdc_groupwidth * DRAID_ROWSIZE;
+	vdc->vdc_devslicesz = (vdc->vdc_groupsz * vdc->vdc_ngroups) /
+	    vdc->vdc_ndisks;
+
+	/*
+	 * Generate permutation map.
+	 */
 	if (draid_permutation_generate(vdc, passes, eval, faults) != 0) {
 		kmem_free(vdc, sizeof (vdev_draid_config_t));
 		return (NULL);
 	}
 
-	ASSERT3U(vdc->vdc_nbases, !=, 0);
-	ASSERT3P(vdc->vdc_base_perms, !=, NULL);
+	ASSERT3U(vdc->vdc_groupwidth, >=, 2);
+	ASSERT3U(vdc->vdc_groupwidth, <=, vdc->vdc_ndisks);
+	ASSERT3U(vdc->vdc_groupsz, >=, 2 * DRAID_ROWSIZE);
+	ASSERT3U(vdc->vdc_devslicesz, >=, DRAID_ROWSIZE);
+	ASSERT3U(vdc->vdc_devslicesz % DRAID_ROWSIZE, ==, 0);
+	ASSERT3U((vdc->vdc_groupwidth * vdc->vdc_ngroups) %
+	    vdc->vdc_ndisks, ==, 0);
 
 	return (vdc);
 }
@@ -1002,8 +889,8 @@ create_config(uint64_t data, uint64_t parity, uint64_t spares,
 static void
 free_config(vdev_draid_config_t *vdc)
 {
-	kmem_free((void *)vdc->vdc_base_perms,
-	    sizeof (uint64_t) * vdc->vdc_nbases + vdc->vdc_children);
+	kmem_free((void *)vdc->vdc_perms,
+	    sizeof (uint64_t) * vdc->vdc_nperms + vdc->vdc_children);
 	kmem_free(vdc, sizeof (*vdc));
 }
 
@@ -1021,8 +908,7 @@ free_config(vdev_draid_config_t *vdc)
  * children arguments.
  *
  * A dRAID configuration is derived by creating slices made up of
- * (children - spares) groups (each group has data + parity logical
- * drives).
+ * groups (each group has data + parity logical drives).
  */
 draidcfg_err_t
 vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
@@ -1030,7 +916,7 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
     nvlist_t **cfgp)
 {
 	vdev_draid_config_t *vdc;
-	uint64_t groups = 1;
+	uint64_t ngroups = 1;
 	uint8_t *value;
 	nvlist_t *cfg;
 
@@ -1065,10 +951,10 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 	 * This is the LCM of the stripe width (data + parity) and the
 	 * number of data drives (children - spares).
 	 */
-	while (groups * (data + parity) % (children - spares) != 0)
-		groups++;
+	while (ngroups * (data + parity) % (children - spares) != 0)
+		ngroups++;
 
-	if (groups > VDEV_DRAID_MAX_GROUPS)
+	if (ngroups > VDEV_DRAID_MAX_GROUPS)
 		return (DRAIDCFG_ERR_GROUPS_INVALID);
 
 	if (passes == 0)
@@ -1077,7 +963,7 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 	/*
 	 * Verify the dRAID configuration constraints have been satisfied.
 	 */
-	if (groups * (data + parity) % (children - spares) != 0)
+	if (ngroups * (data + parity) % (children - spares) != 0)
 		return (DRAIDCFG_ERR_LAYOUT);
 
 	/*
@@ -1085,10 +971,12 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 	 * for the given layout.  If it does, then use it.  Otherwise
 	 * generate a new one to the requested level of optimization.
 	 */
-	cfg = find_known_config(data, parity, spares, children);
+	char fullpath[MAXNAMELEN];
+	cfg = find_known_config(data, parity, spares, children, fullpath);
 	if (cfg != NULL) {
-		if (vdev_draid_config_validate(cfg, data, parity, spares,
-		    children) == DRAIDCFG_OK) {
+		draidcfg_err_t error = vdev_draid_config_validate(cfg,
+		    data, parity, spares, children);
+		if (error == DRAIDCFG_OK) {
 			*cfgp = cfg;
 			return (DRAIDCFG_OK);
 		}
@@ -1098,14 +986,14 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 		 * This shouldn't happen unless the packed nvlists on disk
 		 * have somehow been damaged.  Generate a new configuration.
 		 */
-		if (draid_debug)
-			fprintf(stderr, "Invalid known configuration\n");
+		fprintf(stderr, "Invalid dRAID configuration '%s': %d\n"
+		    "Generating new configuration for use\n", fullpath, error);
 
 		vdev_draid_config_free(cfg);
 	}
 
 	/* Generate configuration, should not fail after this point */
-	vdc = create_config(data, parity, spares, children, passes,
+	vdc = create_config(data, parity, spares, children, ngroups, passes,
 	    eval, faults);
 	if (vdc == NULL)
 		return (DRAIDCFG_ERR_INTERNAL);
@@ -1121,24 +1009,24 @@ vdev_draid_config_generate(uint64_t data, uint64_t parity, uint64_t spares,
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_PARITY, parity);
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_SPARES, spares);
 	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_CHILDREN, children);
-	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_GROUPS, groups);
+	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_GROUPS, ngroups);
 
 	/* Store the number of permutations followed by the permutations */
-	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_BASES, vdc->vdc_nbases);
+	fnvlist_add_uint64(cfg, ZPOOL_CONFIG_DRAIDCFG_NPERMS, vdc->vdc_nperms);
 
-	int size = children * vdc->vdc_nbases * sizeof (uint8_t);
+	int size = children * vdc->vdc_nperms * sizeof (uint8_t);
 	value = kmem_zalloc(size, KM_SLEEP);
 
-	for (int i = 0; i < vdc->vdc_nbases; i++) {
+	for (int i = 0; i < vdc->vdc_nperms; i++) {
 		for (int j = 0; j < children; j++) {
-			uint64_t c = vdc->vdc_base_perms[i * children + j];
+			uint64_t c = vdc->vdc_perms[i * children + j];
 			ASSERT3U(c, <, children);
 			ASSERT3U(c, <=, VDEV_DRAID_MAX_CHILDREN);
 			value[i * children + j] = (uint8_t)c;
 		}
 	}
-	fnvlist_add_uint8_array(cfg, ZPOOL_CONFIG_DRAIDCFG_PERM,
-	    value, children * vdc->vdc_nbases);
+	fnvlist_add_uint8_array(cfg, ZPOOL_CONFIG_DRAIDCFG_PERMS,
+	    value, children * vdc->vdc_nperms);
 	kmem_free(value, size);
 
 	/*
@@ -1420,29 +1308,29 @@ vdev_draid_config_print_error(draidcfg_err_t error)
 		(void) fprintf(stderr, "Inconsistent %s value in "
 		    "configuration\n", ZPOOL_CONFIG_DRAIDCFG_DATA);
 		break;
-	case DRAIDCFG_ERR_BASE_MISSING:
+	case DRAIDCFG_ERR_NPERMS_MISSING:
 		(void) fprintf(stderr, "Missing %s key in configuration\n",
-		    ZPOOL_CONFIG_DRAIDCFG_BASES);
+		    ZPOOL_CONFIG_DRAIDCFG_NPERMS);
 		break;
-	case DRAIDCFG_ERR_BASE_INVALID:
+	case DRAIDCFG_ERR_NPERMS_INVALID:
 		(void) fprintf(stderr, "Invalid %s value in configuration\n",
-		    ZPOOL_CONFIG_DRAIDCFG_BASES);
+		    ZPOOL_CONFIG_DRAIDCFG_NPERMS);
 		break;
-	case DRAIDCFG_ERR_PERM_MISSING:
+	case DRAIDCFG_ERR_PERMS_MISSING:
 		(void) fprintf(stderr, "Missing %s key in configuration\n",
-		    ZPOOL_CONFIG_DRAIDCFG_PERM);
+		    ZPOOL_CONFIG_DRAIDCFG_PERMS);
 		break;
-	case DRAIDCFG_ERR_PERM_INVALID:
+	case DRAIDCFG_ERR_PERMS_INVALID:
 		(void) fprintf(stderr, "Invalid %s value in configuration\n",
-		    ZPOOL_CONFIG_DRAIDCFG_PERM);
+		    ZPOOL_CONFIG_DRAIDCFG_PERMS);
 		break;
-	case DRAIDCFG_ERR_PERM_MISMATCH:
+	case DRAIDCFG_ERR_PERMS_MISMATCH:
 		(void) fprintf(stderr, "Inconsistent %s value in "
-		    "configuration\n", ZPOOL_CONFIG_DRAIDCFG_PERM);
+		    "configuration\n", ZPOOL_CONFIG_DRAIDCFG_PERMS);
 		break;
-	case DRAIDCFG_ERR_PERM_DUPLICATE:
+	case DRAIDCFG_ERR_PERMS_DUPLICATE:
 		(void) fprintf(stderr, "Duplicate %s value in "
-		    "configuration\n", ZPOOL_CONFIG_DRAIDCFG_PERM);
+		    "configuration\n", ZPOOL_CONFIG_DRAIDCFG_PERMS);
 		break;
 	case DRAIDCFG_ERR_LAYOUT:
 		(void) fprintf(stderr, "Invalid dRAID layout");

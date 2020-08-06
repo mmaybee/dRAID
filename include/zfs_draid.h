@@ -116,8 +116,8 @@ typedef struct vdev_draid_config {
 	uint64_t vdc_nspares;		/* # of distributed spares */
 	uint64_t vdc_children;		/* # of children */
 	uint64_t vdc_ngroups;		/* # groups per slice */
-	uint64_t vdc_nbases;		/* # of rows in permutations */
-	uint64_t *vdc_base_perms;	/* base permutation array */
+	uint64_t vdc_nperms;		/* # of rows in permutations */
+	uint64_t *vdc_perms;		/* permutation array */
 
 	/*
 	 * Immutable derived constants.
@@ -154,12 +154,12 @@ typedef enum {
 	DRAIDCFG_ERR_DATA_MISSING,	/* data key/value is missing */
 	DRAIDCFG_ERR_DATA_INVALID,	/* data value is invalid */
 	DRAIDCFG_ERR_DATA_MISMATCH,	/* data value is inconsistent */
-	DRAIDCFG_ERR_BASE_MISSING,	/* base key/value is missing */
-	DRAIDCFG_ERR_BASE_INVALID,	/* base value is invalid */
-	DRAIDCFG_ERR_PERM_MISSING,	/* perm key/value is missing */
-	DRAIDCFG_ERR_PERM_INVALID,	/* perm value is invalid */
-	DRAIDCFG_ERR_PERM_MISMATCH,	/* perm value is inconsistent */
-	DRAIDCFG_ERR_PERM_DUPLICATE,	/* perm value is a duplicate */
+	DRAIDCFG_ERR_NPERMS_MISSING,	/* base key/value is missing */
+	DRAIDCFG_ERR_NPERMS_INVALID,	/* base value is invalid */
+	DRAIDCFG_ERR_PERMS_MISSING,	/* perm key/value is missing */
+	DRAIDCFG_ERR_PERMS_INVALID,	/* perm value is invalid */
+	DRAIDCFG_ERR_PERMS_MISMATCH,	/* perm value is inconsistent */
+	DRAIDCFG_ERR_PERMS_DUPLICATE,	/* perm value is a duplicate */
 	DRAIDCFG_ERR_LAYOUT,		/* groups entirely fill slice */
 	DRAIDCFG_ERR_INTERNAL,		/* internal error */
 } draidcfg_err_t;
