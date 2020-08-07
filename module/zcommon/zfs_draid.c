@@ -696,30 +696,18 @@ draid_permutation_generate(vdev_draid_config_t *vdc, int passes,
 {
 	long int best_seed = 0;
 	draid_map_t *best_map = NULL;
-	int i;
+	int i, nperms;
 
 	/*
 	 * In general, the larger the number of devices in the dRAID the
 	 * more rows should be used in the mapping to improve the overall
 	 * distribution.  However, due to the limited space in the vdev
-	 * label (112k) no more than 32 rows are used.
-	 *
-	 * Example usage for a 255 vdev dRAID pool created using:
-	 *
-	 *   zpool create tank draid /var/tmp/testdir/file*
-	 *
-	 * ZFS Label NVList Config Stats:
-	 *   86812 bytes used, 27836 bytes free (using 75.7%)
-	 *
-	 *   integers:  789  27432 bytes (31.60%)
-	 *    strings:  513  22156 bytes (25.52%)
-	 *   booleans:    3    132 bytes ( 0.15%)
-	 *    nvlists:  259  37092 bytes (42.73%)
-	 *
-	 *  leaf vdevs:  255    210 bytes average
-	 *                      212 bytes largest
+	 * label (112k) only 32 rows are used for pools with >128 children.
 	 */
-	int nperms = 64;
+	if (vdc->vdc_children > 128)
+		nperms = 32;
+	else
+		nperms = 64;
 
 	/*
 	 * Perform the requested number of passes progressively developing

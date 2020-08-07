@@ -60,11 +60,9 @@ extern "C" {
 /*
  * The default number of passes when developing a new dRAID configuration.
  * Larger values will result is more evenly distributed maps but will
- * increase the time required to create a new pool.  A minimum of 3
- * iterations are done to prevent accidentally generating a particularly
- * unbalanced configuration.
+ * increase the time required to create a new pool.
  */
-#define	DRAIDCFG_DEFAULT_PASSES		3
+#define	DRAIDCFG_DEFAULT_PASSES		1
 
 /*
  * Strategy for evaluating the quality of a permutation group mapping
