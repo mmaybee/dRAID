@@ -567,43 +567,6 @@ vdev_draid_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t offset)
 }
 
 /*
- * Check if there's enough space left for the block in the group.  The passed
- * starting offset must be properly align.  If the block fits return an
- * updated 'asizep' and the starting offset to be used, this may be in the
- * next group if there wasn't space in the original group.
- */
-uint64_t
-vdev_draid_check_block(vdev_t *vd, uint64_t start, uint64_t *asizep)
-{
-	uint64_t group = vdev_draid_offset_to_group(vd, start);
-	uint64_t asize = vdev_draid_asize(vd, *asizep);
-	uint64_t end = start + asize - 1;
-
-	/* An allocation may not span metaslabs. */
-	if (start >> vd->vdev_ms_shift != end >> vd->vdev_ms_shift)
-		return (-1ULL);
-
-	/* A block is good if it does not cross a group boundary. */
-	if (group == vdev_draid_offset_to_group(vd, end)) {
-		ASSERT3U(start, ==, vdev_draid_get_astart(vd, start));
-		*asizep = asize;
-		return (start);
-	}
-
-	/* Advance to the next group. */
-	group++;
-	start = vdev_draid_group_to_offset(vd, group);
-	asize = vdev_draid_asize(vd, *asizep);
-	end = start + asize - 1;
-
-	ASSERT3U(group, ==, vdev_draid_offset_to_group(vd, end));
-
-	*asizep = asize;
-
-	return (start);
-}
-
-/*
  * A dRAID spare does not fit into the DTL model. While it has child vdevs,
  * there is no redundancy among them, and the effective child vdev is
  * determined by offset. Moreover, DTLs of a child vdev before the spare
@@ -981,6 +944,31 @@ vdev_draid_max_rebuildable_asize(vdev_t *vd, uint64_t max_segment)
 }
 
 /*
+ * Align the start of the metaslab to the group width and slightly reduce
+ * its size to a multiple of the group width.  Since full stripe write are
+ * required by dRAID this space is unallocatable.  Furthermore, aligning the
+ * metaslab start is important for vdev initialize and TRIM which both operate
+ * on metaslab boundaries which vdev_xlate() expects to be aligned.
+ */
+void
+vdev_draid_metaslab_init(vdev_t *vd, uint64_t *ms_start, uint64_t *ms_size)
+{
+	vdev_draid_config_t *vdc = vd->vdev_tsd;
+
+	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
+
+	uint64_t sz = vdc->vdc_groupwidth << vd->vdev_ashift;
+	uint64_t astart = vdev_draid_get_astart(vd, *ms_start);
+	uint64_t asize = ((*ms_size - (astart - *ms_start)) / sz) * sz;
+
+	*ms_start = astart;
+	*ms_size = asize;
+
+	ASSERT0(*ms_start % sz);
+	ASSERT0(*ms_size % sz);
+}
+
+/*
  * Returns the number of active distributed spares in the dRAID vdev tree.
  */
 static int
@@ -1079,6 +1067,7 @@ vdev_draid_io_start(zio_t *zio)
 	raidz_map_t *rm;
 
 	ASSERT3P(vd->vdev_ops, ==, &vdev_draid_ops);
+	ASSERT3U(zio->io_offset, ==, vdev_draid_get_astart(vd, zio->io_offset));
 
 	rm = vdev_draid_map_alloc(zio);
 

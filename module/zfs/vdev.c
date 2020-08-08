@@ -5083,7 +5083,21 @@ vdev_xlate(vdev_t *vd, const range_seg64_t *logical_rs,
 	 * vdev_draid_xlate() for additional details.
 	 */
 	if (tvd->vdev_ops == &vdev_draid_ops) {
-		uint64_t group, rs_start = logical_rs->rs_start;
+		uint64_t group, astart, rs_start = logical_rs->rs_start;
+
+		/*
+		 * Unaligned ranges must be skipped. All metaslabs are
+		 * correctly aligned so this should not happen, but we
+		 * opt to handle this case anyway for completeness.
+		 */
+		astart = vdev_draid_get_astart(tvd, rs_start);
+		if (astart != rs_start) {
+			physical_rs->rs_start = rs_start;
+			physical_rs->rs_end = rs_start;
+			remain_rs->rs_start = MIN(astart, logical_rs->rs_end);
+			remain_rs->rs_end = logical_rs->rs_end;
+			return;
+		}
 
 		group = vdev_draid_offset_to_group(tvd, rs_start);
 		len = vdev_draid_group_to_offset(tvd, group + 1) - rs_start;

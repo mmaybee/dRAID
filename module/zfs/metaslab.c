@@ -1564,28 +1564,27 @@ metaslab_block_find(zfs_btree_t *t, range_tree_t *rt, uint64_t start,
 #if defined(WITH_DF_BLOCK_ALLOCATOR) || \
     defined(WITH_CF_BLOCK_ALLOCATOR)
 
+/*
+ * Returns the next valid dRAID offset.  The passed offset is expected
+ * to already be aligned.
+ */
 static uint64_t
-metaslab_find_offset(metaslab_t *msp, range_seg_t *rs, range_tree_t *rt,
-    uint64_t psize, uint64_t *sizep)
+metaslab_draid_offset(vdev_t *vd, uint64_t offset, uint64_t size)
 {
-	vdev_t *vd = msp->ms_group->mg_vd;
-	uint64_t offset = rs_get_start(rs, rt);
-	uint64_t size = *sizep;
+	uint64_t start_group = vdev_draid_offset_to_group(vd, offset);
+	uint64_t end_group = vdev_draid_offset_to_group(vd, offset + size - 1);
 
-	if (vd->vdev_ops == &vdev_draid_ops) {
-		*sizep = psize;
-		offset = vdev_draid_check_block(vd, offset, sizep);
-		if (offset == -1ULL)
-			return (-1ULL);
-	}
-	ASSERT3U(size, >=, *sizep);
+	/* Align the provided offset as needed */
+	offset = vdev_draid_get_astart(vd, offset);
 
-	if (offset + *sizep <= rs_get_end(rs, rt))
-		return (offset);
+	/* Blocks may not span groups, advanced to the next group */
+	if (start_group != end_group)
+		offset = vdev_draid_group_to_offset(vd, start_group + 1);
 
-	/* leave size unaltered if we failed to find an offset */
-	*sizep = size;
-	return (-1ULL);
+	/* The offset must be stripe aligned */
+	ASSERT3U(offset, ==, vdev_draid_get_astart(vd, offset));
+
+	return (offset);
 }
 
 /*
@@ -1595,13 +1594,12 @@ metaslab_find_offset(metaslab_t *msp, range_seg_t *rs, range_tree_t *rt,
  */
 static uint64_t
 metaslab_block_picker(metaslab_t *msp, range_tree_t *rt, uint64_t *cursor,
-    uint64_t psize, uint64_t *sizep, uint64_t max_search)
+    uint64_t size, uint64_t max_search)
 {
 	if (*cursor == 0)
 		*cursor = rt->rt_start;
 	zfs_btree_t *bt = &rt->rt_root;
 	zfs_btree_index_t where;
-	uint64_t size = *sizep;
 	range_seg_t *rs = metaslab_block_find(bt, rt, *cursor, size, &where);
 	uint64_t first_found = 0;
 	int count_searched = 0;
@@ -1611,12 +1609,14 @@ metaslab_block_picker(metaslab_t *msp, range_tree_t *rt, uint64_t *cursor,
 
 	while (rs != NULL && (rs_get_start(rs, rt) - first_found <=
 	    max_search || count_searched < metaslab_min_search_count)) {
-		uint64_t offset;
+		uint64_t offset = rs_get_start(rs, rt);
+		vdev_t *vd = msp->ms_group->mg_vd;
 
-		offset = metaslab_find_offset(msp, rs, rt, psize, &size);
-		if (offset != -1ULL) {
+		if (vd->vdev_ops == &vdev_draid_ops)
+			offset = metaslab_draid_offset(vd, offset, size);
+
+		if (offset + size <= rs_get_end(rs, rt)) {
 			*cursor = offset + size;
-			*sizep = size;
 			return (offset);
 		}
 
@@ -1651,7 +1651,7 @@ metaslab_block_picker(metaslab_t *msp, range_tree_t *rt, uint64_t *cursor,
  * ==========================================================================
  */
 static uint64_t
-metaslab_df_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep)
+metaslab_df_alloc(metaslab_t *msp, uint64_t size)
 {
 	/*
 	 * Find the largest power of 2 block size that evenly divides the
@@ -1660,7 +1660,6 @@ metaslab_df_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep)
 	 * bucket) but it does not guarantee that other allocations sizes
 	 * may exist in the same region.
 	 */
-	uint64_t size = *sizep;
 	uint64_t align = size & -size;
 	uint64_t *cursor = &msp->ms_lbas[highbit64(align) - 1];
 	range_tree_t *rt = msp->ms_allocatable;
@@ -1678,7 +1677,7 @@ metaslab_df_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep)
 		offset = -1;
 	} else {
 		offset = metaslab_block_picker(msp, rt,
-		    cursor, psize, &size, metaslab_df_max_search);
+		    cursor, size, metaslab_df_max_search);
 	}
 
 	if (offset == -1) {
@@ -1701,15 +1700,13 @@ metaslab_df_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep)
 			rs = metaslab_block_find(&msp->ms_allocatable_by_size,
 			    rt, msp->ms_start, size, &where);
 		}
-		if (rs != NULL) {
-			offset = metaslab_find_offset(msp, rs, rt, psize,
-			    &size);
-			if (offset != -1)
-				*cursor = offset + size;
+		if (rs != NULL && rs_get_start(rs, rt) + size <= rs_get_end(rs,
+		    rt)) {
+			offset = rs_get_start(rs, rt);
+			*cursor = offset + size;
 		}
 	}
 
-	*sizep = size;
 	return (offset);
 }
 
@@ -2633,13 +2630,9 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object,
 	ms->ms_size = 1ULL << vd->vdev_ms_shift;
 	ms->ms_allocator = -1;
 	ms->ms_new = B_TRUE;
-	if (vd->vdev_ops == &vdev_draid_ops) {
-		uint64_t astart = vdev_draid_get_astart(vd, ms->ms_start);
 
-		ASSERT3U(astart - ms->ms_start, <, ms->ms_size);
-		ms->ms_size -= astart - ms->ms_start;
-		ms->ms_start = astart;
-	}
+	if (vd->vdev_ops == &vdev_draid_ops)
+		vdev_draid_metaslab_init(vd, &ms->ms_start, &ms->ms_size);
 
 	/*
 	 * We only open space map objects that already exist. All others
@@ -2919,29 +2912,23 @@ metaslab_set_fragmentation(metaslab_t *msp, boolean_t nodirty)
 }
 
 /*
- * dRAID metaslabs start at a certain alignment, which causes their sizes to
- * vary by a few sectors. The block allocator may get confused and pick a
+ * A dRAID metaslabs ms_start is always stripe aligned, this causes their sizes
+ * to vary by a few sectors. The block allocator may get confused and pick a
  * distant metaslab because the closer ones are slightly smaller. The small
  * variance doesn't matter when the metaslab has already been allocated from.
  *
  * This function returns adjusted size to calculate metaslab weight, and
  * should not be used for other purposes.
- *
- * XXX - Revist the need for this with the alternate dRAID layout.
  */
 static uint64_t
 metaslab_weight_size(metaslab_t *msp)
 {
 	vdev_t *vd = msp->ms_group->mg_vd;
-	uint64_t size;
 
-	if (vd->vdev_ops != &vdev_draid_ops ||
-	    space_map_allocated(msp->ms_sm) != 0)
+	if (vd->vdev_ops != &vdev_draid_ops || space_map_allocated(msp->ms_sm))
 		return (msp->ms_size);
 
-	size = 1ULL << vd->vdev_ms_shift;
-	ASSERT3U(size, >=, msp->ms_size);
-	return (size);
+	return (1ULL << vd->vdev_ms_shift);
 }
 
 /*
@@ -4610,11 +4597,9 @@ metaslab_group_alloc_verify(spa_t *spa, const blkptr_t *bp, void *tag,
 }
 
 static uint64_t
-metaslab_block_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep,
-    uint64_t txg)
+metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t txg)
 {
 	uint64_t start;
-	uint64_t size = *sizep;
 	range_tree_t *rt = msp->ms_allocatable;
 	metaslab_class_t *mc = msp->ms_group->mg_class;
 
@@ -4622,8 +4607,7 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep,
 	VERIFY(!msp->ms_condensing);
 	VERIFY0(msp->ms_disabled);
 
-	start = mc->mc_ops->msop_alloc(msp, psize, &size);
-	ASSERT3U(size, <=, *sizep);
+	start = mc->mc_ops->msop_alloc(msp, size);
 	if (start != -1ULL) {
 		metaslab_group_t *mg = msp->ms_group;
 		vdev_t *vd = mg->mg_vd;
@@ -4635,7 +4619,7 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep,
 		range_tree_clear(msp->ms_trim, start, size);
 
 		if (range_tree_is_empty(msp->ms_allocating[txg & TXG_MASK]))
-			vdev_dirty(vd, VDD_METASLAB, msp, txg);
+			vdev_dirty(mg->mg_vd, VDD_METASLAB, msp, txg);
 
 		range_tree_add(msp->ms_allocating[txg & TXG_MASK], start, size);
 		msp->ms_allocating_total += size;
@@ -4643,7 +4627,6 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t psize, uint64_t *sizep,
 		/* Track the last successful allocation */
 		msp->ms_alloc_txg = txg;
 		metaslab_verify_space(msp, txg);
-		*sizep = size;
 	}
 
 	/*
@@ -4759,12 +4742,11 @@ metaslab_active_mask_verify(metaslab_t *msp)
 /* ARGSUSED */
 static uint64_t
 metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
-    uint64_t psize, uint64_t *asizep, uint64_t txg, boolean_t want_unique,
-    dva_t *dva, int d, int allocator, boolean_t try_hard)
+    uint64_t asize, uint64_t txg, boolean_t want_unique, dva_t *dva, int d,
+    int allocator, boolean_t try_hard)
 {
 	metaslab_t *msp = NULL;
 	uint64_t offset = -1ULL;
-	uint64_t asize = *asizep;
 
 	uint64_t activation_weight = METASLAB_WEIGHT_PRIMARY;
 	for (int i = 0; i < d; i++) {
@@ -4979,16 +4961,13 @@ metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
 			continue;
 		}
 
-		ASSERT3U(psize, <=, asize);
-		offset = metaslab_block_alloc(msp, psize, &asize, txg);
-		ASSERT3U(asize, <=, *asizep);
+		offset = metaslab_block_alloc(msp, asize, txg);
 		metaslab_trace_add(zal, mg, msp, asize, d, offset, allocator);
 
 		if (offset != -1ULL) {
 			/* Proactively passivate the metaslab, if needed */
 			if (activated)
 				metaslab_segment_may_passivate(msp);
-			*asizep = asize;
 			break;
 		}
 next:
@@ -5058,8 +5037,7 @@ next:
 		 * we may end up in an infinite loop retrying the same
 		 * metaslab.
 		 */
-		ASSERT(!metaslab_should_allocate(msp, asize, try_hard) ||
-		    mg->mg_vd->vdev_ops == &vdev_draid_ops);
+		ASSERT(!metaslab_should_allocate(msp, asize, try_hard));
 
 		mutex_exit(&msp->ms_lock);
 	}
@@ -5070,19 +5048,17 @@ next:
 
 static uint64_t
 metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
-    uint64_t psize, uint64_t *asizep, uint64_t txg, boolean_t want_unique,
-    dva_t *dva, int d, int allocator, boolean_t try_hard)
+    uint64_t asize, uint64_t txg, boolean_t want_unique, dva_t *dva, int d,
+    int allocator, boolean_t try_hard)
 {
 	uint64_t offset;
-	uint64_t asize = *asizep;
 	ASSERT(mg->mg_initialized);
 
-	offset = metaslab_group_alloc_normal(mg, zal, psize, &asize, txg,
-	    want_unique, dva, d, allocator, try_hard);
+	offset = metaslab_group_alloc_normal(mg, zal, asize, txg, want_unique,
+	    dva, d, allocator, try_hard);
 
 	mutex_enter(&mg->mg_lock);
 	if (offset == -1ULL) {
-		ASSERT3U(asize, ==, *asizep);
 		mg->mg_failed_allocations++;
 		metaslab_trace_add(zal, mg, NULL, asize, d,
 		    TRACE_GROUP_FAILURE, allocator);
@@ -5103,7 +5079,6 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 	}
 	mg->mg_allocations++;
 	mutex_exit(&mg->mg_lock);
-	*asizep = asize;
 	return (offset);
 }
 
@@ -5252,12 +5227,8 @@ top:
 
 		ASSERT(mg->mg_class == mc);
 
-		/*
-		 * for some configs (e.g., draid) vdev_psize_to_asize() may
-		 * return an "estimate" for asize, which will be refined in
-		 * metaslab_group_alloc().
-		 */
 		uint64_t asize = vdev_psize_to_asize(vd, psize);
+		ASSERT(P2PHASE(asize, 1ULL << vd->vdev_ashift) == 0);
 
 		/*
 		 * If we don't need to try hard, then require that the
@@ -5265,9 +5236,8 @@ top:
 		 * in this BP (unique=true).  If we are trying hard, then
 		 * allow any metaslab to be used (unique=false).
 		 */
-		uint64_t offset = metaslab_group_alloc(mg, zal, psize, &asize,
-		    txg, !try_hard, dva, d, allocator, try_hard);
-		ASSERT(P2PHASE(asize, 1ULL << vd->vdev_ashift) == 0);
+		uint64_t offset = metaslab_group_alloc(mg, zal, asize, txg,
+		    !try_hard, dva, d, allocator, try_hard);
 
 		if (offset != -1ULL) {
 			/*
