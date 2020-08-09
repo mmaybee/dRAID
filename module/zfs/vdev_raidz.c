@@ -196,6 +196,8 @@ vdev_raidz_cksum_finish(zio_cksum_report_t *zcr, const abd_t *good_data)
 {
 	raidz_map_t *rm = zcr->zcr_cbdata;
 	const size_t c = zcr->zcr_cbinfo;
+	uint64_t secsz = zcr->zcr_sector;
+	uint64_t bigsz;
 	size_t x, offset;
 
 	const abd_t *good = NULL;
@@ -230,12 +232,27 @@ vdev_raidz_cksum_finish(zio_cksum_report_t *zcr, const abd_t *good_data)
 
 			/* fill in the data columns from good_data */
 			offset = 0;
+			bigsz = rm->rm_col[0].rc_size;
 			for (; x < rm->rm_cols; x++) {
 				abd_put(rm->rm_col[x].rc_abd);
 
-				rm->rm_col[x].rc_abd =
-				    abd_get_offset_size((abd_t *)good_data,
-				    offset, rm->rm_col[x].rc_size);
+				/* short columns are padded with empty sector */
+				if (rm->rm_bigcols && x >= rm->rm_bigcols &&
+				    rm->rm_col[x].rc_size == bigsz) {
+					rm->rm_col[x].rc_abd =
+					    abd_alloc(rm->rm_col[x].rc_size,
+					    B_TRUE);
+					abd_copy(rm->rm_col[x].rc_abd,
+					    (abd_t *)good_data,
+					    rm->rm_col[x].rc_size - secsz);
+					abd_zero_off(rm->rm_col[x].rc_abd,
+					    rm->rm_col[x].rc_size - secsz,
+					    secsz);
+				} else {
+					rm->rm_col[x].rc_abd =
+					    abd_get_offset_size((abd_t *)good_data,
+					    offset, rm->rm_col[x].rc_size);
+				}
 				offset += rm->rm_col[x].rc_size;
 			}
 
@@ -250,7 +267,10 @@ vdev_raidz_cksum_finish(zio_cksum_report_t *zcr, const abd_t *good_data)
 
 			offset = 0;
 			for (x = rm->rm_firstdatacol; x < rm->rm_cols; x++) {
-				abd_put(rm->rm_col[x].rc_abd);
+				if (rm->rm_bigcols && x >= rm->rm_bigcols)
+					abd_free(rm->rm_col[x].rc_abd);
+				else
+					abd_put(rm->rm_col[x].rc_abd);
 				rm->rm_col[x].rc_abd = abd_get_offset_size(
 				    rm->rm_abd_copy, offset,
 				    rm->rm_col[x].rc_size);
